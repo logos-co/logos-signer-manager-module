@@ -67,6 +67,10 @@ pub struct Intent {
     #[serde(default)]
     pub purpose: String,
     pub legs: Vec<Leg>,
+    /// The Bitcoin wallet's xpub, from the requester that has it open: checked against the
+    /// account's roster key, used for this request only.
+    #[serde(default)]
+    pub xpub: String,
 }
 
 // ── the record ──────────────────────────────────────────────────────────────
@@ -304,6 +308,8 @@ impl Approvals {
             }
             if matches!(r.state, State::Settled(_)) && r.settled_at.is_none() {
                 r.settled_at = Some(now);
+                // The xpub the requester brought served this request only.
+                r.intent.xpub.clear();
             }
         }
         self.records.retain(|r| {
@@ -581,6 +587,11 @@ impl Approvals {
             account: found.account.id.clone(),
             payload: payload_for(&r.intent, &prepared, &found.info)?,
             secret: (!secret.is_empty() && found.info.collects != logos_signer_interface::Collects::Nothing).then(|| Secret::new(secret)),
+            // A Bitcoin request carries the account's xpub; the signer checks it against the account too.
+            xpub: match &prepared {
+                Prepared::Psbt { found, .. } => found.account.xpub.clone(),
+                Prepared::Evm { .. } => None,
+            },
         };
         let signer = signers.signer(found.signer);
         let job = match signer.sign(request) {
@@ -762,7 +773,8 @@ fn prepare_on(signers: &mut Registry, intent: &Intent, pinned: Option<Found>) ->
     let [Leg::Psbt { network, psbt }] = intent.legs.as_slice() else {
         return Err(bad("intent: a Bitcoin request carries exactly one psbt leg"));
     };
-    let found = match pinned { Some(f) => f, None => signers.find(intent.group.trim())? };
+    let mut found = match pinned { Some(f) => f, None => signers.find(intent.group.trim())? };
+    found.account = with_brought_xpub(&found.account, intent)?;
     let acct = AccountPublic::from_account(&found.account)?;
     let net: Network = acct.chain.network(network)?;
     let parsed = btcpsbt::parse(psbt)?;
@@ -775,6 +787,18 @@ fn prepare_on(signers: &mut Registry, intent: &Intent, pinned: Option<Found>) ->
         .map_or_else(|| found.account.id.clone(), |l| format!("\"{l}\""));
     let checked = btcpsbt::check(&Secp256k1::verification_only(), &acct, net, &name, &parsed)?;
     Ok(Prepared::Psbt { found, acct, psbt: Box::new(parsed), checked, name })
+}
+
+/// The account with the xpub the requester brought, once it proves to be this account's.
+fn with_brought_xpub(account: &logos_signer_interface::Account, intent: &Intent) -> Result<logos_signer_interface::Account> {
+    let brought = intent.xpub.trim();
+    if brought.is_empty() {
+        return Ok(account.clone());
+    }
+    let key = roster::key_of(account).ok_or_else(|| bad("intent: this wallet has no roster key to check its xpub"))?;
+    logos_signer_interface::unlock::check_xpub(&key, account.family, account.chain, brought)
+        .map_err(|_| bad("intent: the xpub is not this wallet's"))?;
+    Ok(logos_signer_interface::Account { xpub: Some(brought.to_string()), ..account.clone() })
 }
 
 /// The digest each leg signs, from the same parsed value the person was shown.
@@ -1426,6 +1450,29 @@ mod tests {
     }
 
     #[test]
+    fn a_bitcoin_request_brings_its_wallets_xpub_checked_and_kept_for_that_request_only() {
+        let mut s = Registry::new();
+        let opts = MockOptions { collects: Collects::Password, secret: "pw".into(), ..Default::default() };
+        s.add("keystore_module", Box::new(NoXpub(MockSigner::new(opts))));
+        let mut ap = Approvals::new();
+        let (_, listed, acct) = crate::psbt::tests::ours(crate::btc::Family::Segwit);
+        let (_, _, taproot) = crate::psbt::tests::ours(crate::btc::Family::Taproot);
+        let psbt = crate::psbt::tests::sample(&acct);
+        let bring = |xpub: &str| psbt_intent(&listed.id, &psbt).replacen("{", &format!(r#"{{"xpub":"{xpub}","#), 1);
+        assert!(ap.request(&mut s, "x", &psbt_intent(&listed.id, &psbt)).is_err(), "no xpub listed, none brought");
+        let foreign = ap.request(&mut s, "x", &bring(&taproot.xpub.to_string())).unwrap_err();
+        assert!(foreign.to_string().contains("not this wallet's"), "{foreign}");
+        let (h, r) = ap.request(&mut s, "bitcoin_wallet_core_module", &bring(&acct.xpub.to_string())).unwrap();
+        let v = ap.acknowledge(&mut s, &h).unwrap();
+        assert!(v.render_lines.join("\n").contains("Fee 1,190 sats"));
+        assert_eq!(approve(&mut ap, &mut s, &h, &v.bundle_id, "pw").unwrap(), 1);
+        let signed: Psbt = ap.fetch_result(&mut s, &h, &r).unwrap().remove(0).parse().unwrap();
+        assert!(signed.inputs.iter().all(|i| !i.partial_sigs.is_empty()));
+        ap.sweep();
+        assert!(ap.records.iter().all(|r| r.intent.xpub.is_empty()), "nothing kept once settled");
+    }
+
+    #[test]
     fn a_bitcoin_request_names_its_wallet_and_carries_one_psbt() {
         let (mut s, mut ap) = fixture();
         let (_, listed, acct) = crate::psbt::tests::ours(crate::btc::Family::Segwit);
@@ -1435,6 +1482,30 @@ mod tests {
         let two = psbt_intent(&listed.id, &psbt).replace("}]}", r#"},{"kind":"message","text":"x"}]}"#);
         assert!(ap.request(&mut s, "x", &two).is_err());
         assert!(ap.request(&mut s, "x", &psbt_intent(ACCT0, &psbt)).is_err(), "an EVM account is no wallet");
+    }
+
+    /// A signer that lists its Bitcoin accounts without their xpubs.
+    struct NoXpub(MockSigner);
+
+    impl Signer for NoXpub {
+        fn info(&self) -> SignerInfo {
+            self.0.info()
+        }
+        fn accounts(&mut self) -> logos_signer_interface::Result<Vec<logos_signer_interface::Account>> {
+            Ok(self.0.accounts()?.into_iter().map(|a| logos_signer_interface::Account { xpub: None, ..a }).collect())
+        }
+        fn sign(&mut self, request: SignRequest) -> logos_signer_interface::Result<String> {
+            self.0.sign(request)
+        }
+        fn status(&mut self, job: &str) -> logos_signer_interface::Result<JobStatus> {
+            self.0.status(job)
+        }
+        fn result(&mut self, job: &str) -> logos_signer_interface::Result<Vec<Signature>> {
+            self.0.result(job)
+        }
+        fn cancel(&mut self, job: &str) -> logos_signer_interface::Result<()> {
+            self.0.cancel(job)
+        }
     }
 
     /// A signer that answers with signatures over something else.

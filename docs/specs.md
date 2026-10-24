@@ -57,7 +57,11 @@ stays in `signing`, and each later call checks how the job stands:
 | B | `roster` | any **named module** |
 | C | `accounts`, `signers`, `caller_identity`, and for now `configure` | anyone |
 | B | `request_open`, `request_unlock` | any **named module**, collecting with `fetch_result` and its receipt |
-| D | `access_requests`, `acknowledge_access`, `approve_access`, `reject_access`, `open_accounts`, `unlock`, `lock` | a configured **custodian** (default `evm_keystore_ui`, the keys app) |
+| B | `wallets`, `data_key` | any **named module**; `data_key` answers the caller's own keys only |
+| — | `enroll_seed` | a configured **signer** module |
+| A | `wallet_settings`, `unlock_wallet`, `unlock_progress`, `cancel_unlock`, `lock_wallets`, `set_rule`, `change_keys`, `set_names`, `create_password`, `rename_password`, `change_password`, `remove_password` | a configured **approver** |
+| A and D | `access_requests`, `acknowledge_access`, `approve_access`, `reject_access` | an approver for opens (its consent), or the custodian |
+| D | `open_accounts`, `unlock`, `lock` | a configured **custodian** (default `evm_keystore_ui`, the keys app) |
 | — | `account_descriptors`, and `close_account` for one's own wallet | a module the wallet is open for |
 | A and D | `unlocked`, `unattended_signatures` | the approver or the custodian |
 
@@ -106,8 +110,8 @@ refuse or stall a request, but it can't get a false signature past the checks ab
 | `signers` | — | `{ ok, signers: [{ name, info? }] }` |
 | `caller_identity` | — | `{ ok, kind, identity, approvers, custodians, signers }`: everything a total `configure` must repeat |
 | `request_open`, `request_unlock` | `params_json` | `{ ok, handle, receipt, state }` |
-| `access_requests` | — | `{ ok, requests: [{ handle, requester, kind, state, ageMs }] }` |
-| `acknowledge_access` | `handle` | `{ ok, handle, requester, kind, bundle_id, lines, asked }` |
+| `access_requests` | — | `{ ok, requests: [{ handle, requester, kind, state, ageMs, seed }] }`; opens only, for an approver |
+| `acknowledge_access` | `handle` | `{ ok, handle, requester, kind, bundle_id, lines, asked, seed }` |
 | `approve_access` | `params_json` | `{ ok }`, or `{ ok: false, code, error }` |
 | `reject_access` | `handle` | `bool` |
 | `account_descriptors` | `group` | `{ ok, group, external, internal }` |
@@ -117,6 +121,16 @@ refuse or stall a request, but it can't get a false signature past the checks ab
 | `lock` | `params_json` | `{ ok, locked }` |
 | `unlocked` | — | `{ ok, unlocked: [{ account, expiresInMs, countLeft, apps, confirm }] }` |
 | `unattended_signatures` | — | `{ ok, signed: [{ handle, requester, account, ageMs }] }` |
+| `wallets` | — | `{ ok, wallets: [{ seed, name, locked, kinds, privateName? }] }` |
+| `data_key` | `params_json` | `{ ok, key, generation, seed }`, or `{ ok: false, code: "locked" }` |
+| `enroll_seed` | `params_json` | `{ ok, seed, new, unlocked }` |
+| `wallet_settings` | — | `{ ok, wallets: [{ seed, name, privateName?, locked, holders, device, index, generation, ways, origin?, birthday? }], passwords: [{ id, name, wallets }] }`; `device`: its holders give an unlock key |
+| `unlock_wallet`, `set_rule`, `change_keys` | `params_json` | `{ ok, state: "done" }`, or `{ ok, state: "device", handle }`, or `{ ok: false, code, error }` |
+| `unlock_progress` | `handle` | `{ ok, state, seed, step?, code?, error? }` |
+| `cancel_unlock` | `handle` | `bool` |
+| `lock_wallets` | `params_json` | `{ ok, locked }` |
+| `set_names`, `rename_password`, `change_password`, `remove_password` | `params_json` | `{ ok }` |
+| `create_password` | `params_json` | `{ ok, id }` |
 
 `approve`'s `code` is the signer's: `wrong_secret` (ask again), `locked` (no password and no
 unlock), `unavailable` (the signer module didn't answer, or the chosen device isn't connected). The
@@ -133,7 +147,10 @@ manager groups holders by what the account is:
 
 - **The key:** an EVM account's lowercase address; a Bitcoin account's `btc_` and 32 hex of a
   SHA-256 over its family, chain, chain code and public key. Two xpubs of one key whose metadata
-  differs, such as the parent fingerprint, are one account.
+  differs, such as the parent fingerprint, are one account. A signer may list that key as the
+  account's `key`; the manager checks it against the xpub.
+- **Guards:** a row under the unlock keys' purpose (`m/1280263247'`), or an EVM row outside
+  `m/44'/60'`, is dropped from every listing, as an edited file might put one there.
 - **Ranking:** the keystore first; then connected devices, a Keycard reader before a USB device;
   then QR wallets, which need no connection; then devices that aren't connected. Within each, the
   configured signer order.
@@ -176,6 +193,11 @@ render, the commitment rules and the refusals (displayable text only, declared E
 64 KiB, four pending per requester and sixteen in all, a sixty-second sweep for offers nobody
 claimed) are the keystore's. The commitment's domain tag is now `logos-signer-manager-approval-v1`.
 
+A Bitcoin request may carry `xpub`: the wallet's, from the requester that has it open. The manager
+refuses it unless it gives the wallet's roster key, uses it for this request alone wherever it reads
+the account (the holders, the PSBT checks, the result), passes it to the signer in the
+`SignRequest`, and forgets it once the request settles.
+
 ### A PSBT
 
 Read as keystore_module's spike K0 read it:
@@ -194,10 +216,76 @@ The manager computes each input's sighash and hands the sighashes to the signer 
 input's path. It adds a signature to the PSBT only after the signature verifies. One signature
 missing, or one that fails, adds none.
 
+## Wallets and their keys
+
+A **wallet** here is a seed, whichever signers hold it: the keystore, a Keycard, a Shell, a QR
+wallet. Each module keeps its own data about a wallet encrypted with keys of its own, and the
+person unlocks the wallet once per session, in the Signer app, for every module at once. The
+manager holds the unlocked keys and hands each module only its own. Nothing stays unlocked past a
+restart or a `lock_wallets`.
+
+- **The unlock key** of a seed is the compressed public key at `m/1280263247'/n'`, which every
+  holder of the seed gives (`unlock_key` in the signer interface). `n` is the seed's unlock index:
+  0 at first, and the next one after `change_keys` with `newIndex`, as when a QR answer may have
+  been photographed.
+- **The seed key** is random, one per seed, with a generation. A module's key is
+  `HKDF-SHA256(seed key, "logos/data/v1", module ‖ 0 ‖ scope ‖ 0 ‖ generation)`; `data_key({ seed,
+  scope, generation? })` answers it to the caller, named by its identity, or `locked`. A holder
+  of the seed may name it its own way, as it lists it in `seed`. A module that knows an account
+  and not its seed names the `account` instead, looked up among the accounts the signers last
+  listed (never asking one), and the answer names the `seed`. The current
+  generation is the default; an earlier one still answers, so a module reads its old data and
+  writes it again under the new key in its own time. `"profile"` instead of a seed is a key for
+  data of no wallet, such as contacts: any unlocked wallet opens it.
+- **Ways in.** A wallet's rule is one or more ways in, each a set of factors that must all be
+  there: `device` (the unlock key, from any holder) and named passwords (`password:<id>`). Each way
+  wraps the seed key under `HKDF` over its factors' keys, with XChaCha20-Poly1305 bound to the
+  seed, the way and the generation. "Device only" is the default; a QR wallet that gives no unlock
+  key takes a password alone. Forgetting the password of a "device and password" way loses the
+  wallet's data: the person adds the wallet again.
+- **Always unlocked.** A rule of one way that takes nothing, `[[]]`, leaves the wallet open from
+  the moment the module starts, and Lock leaves it open: its seed key is wrapped under a key anyone
+  with the files can derive, so its data is as readable as if it were stored in the clear. Modules
+  keep using `data_key` unchanged. Moving it back to a protected rule gives it new keys, since the
+  old one sat where anyone could read it; data under the old generation still opens through the chain.
+- **Passwords** are named and shared: one can unlock several wallets. Each has a key of its own
+  under its scrypt output (N = 2^17, r = 8, p = 1), so `change_password` touches no wallet, and
+  `remove_password` is refused while a rule takes it. Their names show in the clear.
+- **Names.** A wallet's public `name` shows while it is locked; its private name, origin and
+  birthday are sealed under its seed key and show once it is unlocked.
+- **Adding.** A signer calls `enroll_seed` from its add flow, while the holder's unlock key at
+  index 0 is at hand, so adding never asks twice: `{ seed, kind, unlockKey?, name, origin?,
+  birthday? }`, where `seed` is the signer's own name for the seed (a Keycard's key UID, a Shell's
+  master key id, a QR wallet's master fingerprint, a keystore wallet's id). A new wallet is
+  unlocked at once. A seed already known, by that holder or by its unlock key, gains the holder.
+  Signers list a wallet's accounts, xpubs included, only while it is unlocked.
+- **Unlocking.** The Signer app calls `unlock_wallet({ seed, way, holder?, secret?, passwords? })`.
+  A way without the device settles at once. One with it asks the holder for the unlock key: a PIN
+  session, a press on the Shell or a QR round trip. The reply is then `{ state: "device", handle }`,
+  and `unlock_progress(handle)` reports `device` with its `step`, `needs_password` (the device
+  answered, a password didn't: `unlock_wallet({ handle, passwords })` tries again without the
+  device), `done` or `failed`. `set_rule` and `change_keys` take the same step when a new way, or
+  any way, needs the device.
+- **Files.** `<persistence>/unlock/seeds.json` and `passwords.json`, the directory 0700 and the
+  files 0600, written atomically. They hold no key in the clear. Files the manager can't read are
+  left alone, and every call answers why.
+- `data_key` and `enroll_seed` answer a module that may be waiting on its own call, so they call
+  out to no module.
+
 ## Opening and unlocking
 
-A Bitcoin wallet's descriptors and database key reach a module only once a person opens the
-wallet for it in the keys app, and an account stays unlocked only on terms a person chose.
+A Bitcoin wallet's descriptors reach a module only once a person opens the wallet for it: in the
+Signer app, an approver's consent once the wallet is unlocked, or in the keys app, the custodian's
+older path with a database key from the keystore. An account stays unlocked for signing only on
+terms a person chose.
+
+- **Consent.** An approver claims an open with `acknowledge_access`, which names the wallet's
+  `seed` so the app shows it beside the wallet, and approves it with `{ handle, bundle_id, group?
+  }`. A locked wallet answers `code: locked` and the request stays on screen. The result is `{
+  group, family, chain, network, external, internal, fingerprint, seed, origin?, birthday? }`, with
+  no database key: the module takes its own from `data_key(seed, …)`. A request may name the wallet
+  by `{ group, seed }` while its seed is locked and no signer lists it; it is checked once unlocked.
+  An approver decides opens only, and the first app to claim a request keeps it.
 
 - `request_open` takes `{ group, network? }` to reopen a wallet, or `{ family, network }` to let the
   person pick, create or restore one, with optional `unlock` terms and a `reason`. A network must
@@ -259,7 +347,9 @@ when it starts, since the terms it kept are gone.
 `approval_offered` and `approval_settled` (handle, state), `approval_progress` when a request moves
 to `signing`, and `accounts_changed` (count) after a signer reports its accounts changed. For opening
 and unlocking: `access_requested`, `access_settled`, `unlock_changed` (account) and
-`signed_without_asking` (handle). Handles only: the event plane is unauthenticated.
+`signed_without_asking` (handle). For wallets: `wallets_changed` (seed) when one is added,
+unlocked or changed, and `wallets_locked` (count). Handles and ids only: the event plane is
+unauthenticated.
 
 The manager listens to each signer's `signer_accounts_changed` and `sign_progress`, and announces
 what they change as they come: a device plugged out, or a job its person ended on the device. An app

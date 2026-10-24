@@ -2,32 +2,30 @@
 //! Bitcoin wallet is `g_…` in the keystore, `keycard-…` on a card), so holders are grouped by what
 //! the account is: its address, or a Bitcoin account's key.
 
-use std::str::FromStr;
-
-use bitcoin::bip32::Xpub;
+use logos_signer_interface::unlock::roster_key;
 use logos_signer_interface::{Account, Family};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 
 use crate::registry::Found;
 
 /// The keystore's module: the only signer that signs inside an unlock.
 pub const KEYSTORE: &str = "keystore_module";
 
-/// What makes two signers' accounts one: an EVM address without case, or `btc_` and 32 hex of a
-/// hash over a Bitcoin account's family, chain, chain code and key, whatever its xpub's metadata.
+/// What makes two signers' accounts one: an EVM address without case, or a Bitcoin account's roster
+/// key (`btc_` and 32 hex of a hash over its family, chain, chain code and key), as its signer lists
+/// it or worked out from its xpub.
 pub fn key_of(a: &Account) -> Option<String> {
     if a.family == Family::Evm {
         let address = a.address.as_deref().unwrap_or(&a.id).trim();
         return (!address.is_empty()).then(|| address.to_ascii_lowercase());
     }
-    let xpub = Xpub::from_str(a.xpub.as_deref()?).ok()?;
-    let mut h = Sha256::new();
-    h.update(serde_json::to_string(&a.family).ok()?.as_bytes());
-    h.update(serde_json::to_string(&a.chain).ok()?.as_bytes());
-    h.update(xpub.chain_code.as_bytes());
-    h.update(xpub.public_key.serialize());
-    Some(format!("btc_{}", hex::encode(&h.finalize()[..16])))
+    let listed = a.key.as_deref().map(str::trim).filter(|k| {
+        k.len() == 36 && k.starts_with("btc_") && k[4..].bytes().all(|b| b.is_ascii_hexdigit())
+    });
+    match listed {
+        Some(k) => Some(k.to_ascii_lowercase()),
+        None => roster_key(a.family, a.chain, a.xpub.as_deref()?).ok(),
+    }
 }
 
 /// How a signer reaches its keys.
@@ -158,7 +156,9 @@ pub fn holder_json(f: &Found) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin::bip32::Xpub;
     use logos_signer_interface::{Chain, Collects, SignerInfo};
+    use std::str::FromStr;
 
     pub fn found(signer: usize, name: &str, kind: &str, account: Account) -> Found {
         Found {
@@ -172,6 +172,7 @@ mod tests {
                 request_kinds: vec![],
                 shows_request: false,
                 collects: Collects::Nothing,
+                unlock_key: false,
             },
             account,
         }
@@ -188,6 +189,8 @@ mod tests {
             xpub: None,
             label: None,
             available,
+            key: None,
+            seed: None,
         }
     }
 
@@ -198,8 +201,10 @@ mod tests {
 
     #[test]
     fn a_bitcoin_account_is_its_key_not_its_xpubs_metadata() {
-        let (_, a, _) = crate::psbt::tests::ours(crate::btc::Family::Segwit);
+        let (_, mut a, _) = crate::psbt::tests::ours(crate::btc::Family::Segwit);
         assert_eq!(a.chain, Some(Chain::Test));
+        let listed = a.key.take();
+        assert_eq!(key_of(&a), listed, "the key a signer lists is the one its xpub gives");
         let mut other = Xpub::from_str(a.xpub.as_deref().unwrap()).unwrap();
         other.parent_fingerprint = Default::default();
         let mut b = a.clone();
@@ -209,6 +214,12 @@ mod tests {
         assert!(key_of(&a).unwrap().starts_with("btc_") && key_of(&a).unwrap().len() == 36);
         b.family = Family::BitcoinTaproot;
         assert_ne!(key_of(&a), key_of(&b), "the same key under another script is another account");
+        // A signer that lists no xpub is known by the key it lists; a malformed one is ignored.
+        let (key, mut c) = (listed.clone().unwrap(), a.clone());
+        (c.xpub, c.key) = (None, Some(key.to_ascii_uppercase().replace("BTC_", "btc_")));
+        assert_eq!(key_of(&c), listed);
+        c.key = Some("btc_nothex".into());
+        assert_eq!(key_of(&c), None);
     }
 
     #[test]

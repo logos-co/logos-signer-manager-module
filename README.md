@@ -23,6 +23,12 @@ consulted. `configure` names the approvers, the custodians and the signers. Unco
 the keystore, then the Keycard Shell's, the Keycard's and the QR signer's modules when they are
 installed. Those three are optional dependencies, so installed ones load with the manager.
 
+Each wallet, a seed whichever signers hold it, is unlocked once per session in the Signer app, by
+its device, a password, or both, as its rule says. The manager then hands each module keys of its
+own for that wallet's data (`data_key`), and signers list the wallet's accounts. `wallets` lists
+them, `enroll_seed` registers one a signer adds, and the Signer app keeps the rules, the named
+passwords and the names (see [Wallets and their keys](docs/specs.md#wallets-and-their-keys)).
+
 See [`docs/specs.md`](docs/specs.md) for the reference, and
 [`doctests/signer-manager-runtime.test.yaml`](doctests/signer-manager-runtime.test.yaml) for the
 round trip through `logoscore`.

@@ -71,8 +71,9 @@ struct RolesWire {
 }
 
 impl Roles {
-    /// Replace everything from `{ approvers?, custodians?, signers? }`. Total, as the keystore's:
-    /// what the document doesn't name is held by nobody. A malformed document changes nothing.
+    /// Replace everything from `{ approvers?, custodians?, signers? }`. Total, as the
+    /// keystore's: what the document doesn't name is held by nobody. A malformed document changes
+    /// nothing.
     pub fn configure(&mut self, config_json: &str) -> Result<(), String> {
         let doc: serde_json::Value = serde_json::from_str(config_json).map_err(|e| e.to_string())?;
         if !doc.is_object() {

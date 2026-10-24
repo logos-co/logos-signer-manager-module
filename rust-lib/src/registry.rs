@@ -3,6 +3,7 @@
 
 use std::time::{Duration, Instant};
 
+use logos_signer_interface::unlock::{evm_path_ok, is_reserved};
 use logos_signer_interface::{Account, Family, Signer, SignerInfo};
 
 use crate::error::{ManagerError, Result};
@@ -39,6 +40,16 @@ fn same_id(a: &Account, id: &str) -> bool {
     match a.family {
         Family::Evm => a.id.eq_ignore_ascii_case(id.trim()),
         _ => a.id == id.trim(),
+    }
+}
+
+/// Nothing under the reserved purpose, where unlock keys live, and an EVM account under m/44'/60':
+/// a listing that says otherwise was edited, and the account is not offered.
+fn admissible(a: &Account) -> bool {
+    match a.path.as_deref() {
+        Some(p) if is_reserved(p) => false,
+        Some(p) if a.family == Family::Evm => evm_path_ok(p),
+        _ => true,
     }
 }
 
@@ -91,7 +102,7 @@ impl Registry {
             e.missed = e.info.is_none().then(Instant::now);
         }
         if e.accounts.is_none() && e.info.is_some() {
-            e.accounts = e.signer.accounts().ok();
+            e.accounts = e.signer.accounts().ok().map(|all| all.into_iter().filter(admissible).collect());
         }
     }
 
@@ -188,6 +199,19 @@ impl Registry {
         }).collect()
     }
 
+    /// The signer that lists an account, by id or address, and the seed as it names it: from
+    /// what is already loaded, never asking a signer.
+    pub fn seed_of_account(&self, id: &str) -> Option<(String, String)> {
+        let id = id.trim();
+        self.entries.iter().find_map(|e| {
+            let a = e.accounts.iter().flatten().find(|a| {
+                a.seed.is_some()
+                    && (same_id(a, id) || a.address.as_deref().is_some_and(|ad| ad.eq_ignore_ascii_case(id)))
+            })?;
+            Some((e.name.clone(), a.seed.clone()?))
+        })
+    }
+
     /// Every account once, under its preferred available signer.
     pub fn accounts(&mut self) -> Vec<(String, Account)> {
         let mut out: Vec<(String, Account)> = Vec::new();
@@ -252,6 +276,7 @@ mod tests {
                 request_kinds: Vec::new(),
                 shows_request: false,
                 collects: Collects::Nothing,
+                unlock_key: false,
             }
         }
         fn accounts(&mut self) -> logos_signer_interface::Result<Vec<Account>> {
@@ -292,6 +317,21 @@ mod tests {
     }
 
     #[test]
+    fn an_accounts_seed_comes_from_what_is_loaded_without_asking() {
+        let asks = Arc::new(AtomicUsize::new(0));
+        let mut r = Registry::new();
+        r.add("keycard_module", Box::new(Absent(asks.clone())));
+        r.add("keystore_module", Box::new(MockSigner::new(MockOptions::default())));
+        assert_eq!(r.seed_of_account("0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"), None, "nothing loaded yet");
+        assert_eq!(asks.load(SeqCst), 0);
+        let bitcoin = r.accounts().into_iter().find(|(_, a)| a.family != Family::Evm).unwrap().1.id;
+        let (holder, seed) = r.seed_of_account("0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266").unwrap();
+        assert_eq!(holder, "keystore_module");
+        assert_eq!(r.seed_of_account(&bitcoin).map(|(_, s)| s), Some(seed));
+        assert_eq!(r.seed_of_account("0x0000000000000000000000000000000000000001"), None);
+    }
+
+    #[test]
     fn an_account_is_found_under_the_first_signer_that_offers_it() {
         let mut r = Registry::new();
         r.add("first", Box::new(MockSigner::new(MockOptions::default())));
@@ -326,5 +366,44 @@ mod tests {
         assert_eq!(r.holder(segwit, "qr_signer_module").unwrap().name, "qr_signer_module");
         assert!(r.holder(segwit, "keycard_module").is_err());
         assert!(r.holders("btc_00").is_err());
+    }
+
+    /// A signer whose files were edited: its rows point at an open key and off the EVM paths.
+    struct Edited(MockSigner);
+
+    impl Signer for Edited {
+        fn info(&self) -> SignerInfo {
+            self.0.info()
+        }
+        fn accounts(&mut self) -> logos_signer_interface::Result<Vec<Account>> {
+            let mut out = self.0.accounts()?;
+            let mut evm = out.iter().find(|a| a.family == Family::Evm).unwrap().clone();
+            let mut btc = out.iter().find(|a| a.family == Family::Bitcoin).unwrap().clone();
+            (evm.id, evm.address, evm.path) = ("0x01".into(), Some("0x01".into()), Some("m/44'/0'/0'/0/0".into()));
+            (btc.id, btc.key, btc.path) = ("open-key".into(), Some(format!("btc_{}", "0".repeat(32))), Some("m/1280263247'/0'".into()));
+            out.extend([evm, btc]);
+            Ok(out)
+        }
+        fn sign(&mut self, r: SignRequest) -> logos_signer_interface::Result<String> {
+            self.0.sign(r)
+        }
+        fn status(&mut self, job: &str) -> logos_signer_interface::Result<JobStatus> {
+            self.0.status(job)
+        }
+        fn result(&mut self, job: &str) -> logos_signer_interface::Result<Vec<Signature>> {
+            self.0.result(job)
+        }
+        fn cancel(&mut self, job: &str) -> logos_signer_interface::Result<()> {
+            self.0.cancel(job)
+        }
+    }
+
+    #[test]
+    fn no_row_under_the_open_keys_purpose_nor_an_evm_row_off_44_60_is_offered() {
+        let mut r = Registry::new();
+        r.add("keycard_module", Box::new(Edited(MockSigner::new(MockOptions::default()))));
+        assert_eq!(r.accounts().len(), 3, "only the mock's own three");
+        assert!(r.find("0x01").is_err());
+        assert!(r.find("open-key").is_err());
     }
 }

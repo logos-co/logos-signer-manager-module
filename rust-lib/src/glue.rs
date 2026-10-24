@@ -11,12 +11,17 @@ use std::time::Duration;
 use serde_json::json;
 use zeroize::Zeroizing;
 
-use logos_signer_interface::{json as signer_json, Account, ErrorCode, JobStatus, SignRequest, Signature, Signer, SignerError, SignerInfo};
+use logos_signer_interface::{
+    json as signer_json, Account, ErrorCode, JobStatus, SignRequest, Signature, Signer, SignerError, SignerInfo, UnlockKey,
+    UnlockKeyRequest,
+};
 
-use crate::access::{Access, Cover, Decision, KeyHolder, OpenedWallet, Terms, Unlocked};
+use crate::access::{Access, Cover, Decision, Gate, KeyHolder, OpenedWallet, Role, Terms, Unlocked};
 use crate::approval::{Approvals, Approved, Move};
 use crate::gate;
 use crate::registry::Registry;
+use crate::unlock::{About, Factor, Holder, Unlock};
+use crate::wallets::{Begun, Then, Wallets};
 use crate::ManagerError;
 
 /// The signer manager's IPC contract.
@@ -68,25 +73,30 @@ pub trait SignerManagerModule: Send + Sync + 'static {
     fn reject(&self, handle: String) -> bool;
 
     // ── Opening and unlocking: asked by any named module, decided by the custodian ──
-    /// Ask a person to open a Bitcoin wallet for the caller: `{ group, network? }` to reopen one, or
-    /// `{ family, network }` to let the person pick, create or restore one, with optional `unlock`
-    /// terms and a `reason` → `{ ok, handle, receipt, state }`. `fetch_result` then returns `{ ok,
-    /// result: { group, family, chain, network, external, internal, fingerprint, databaseKey, origin,
-    /// birthday, unlocked } }`. Tier B.
+    /// Ask a person to open a Bitcoin wallet for the caller: `{ group, network?, seed? }` to reopen
+    /// one (`seed` names it while its seed is locked), or `{ family, network }` to let the person
+    /// pick, create or restore one, with optional `unlock` terms and a `reason` → `{ ok, handle,
+    /// receipt, state }`. Given in the Signer app, `fetch_result` returns `{ ok, result: { group,
+    /// family, chain, network, external, internal, fingerprint, seed, origin?, birthday? } }`, and
+    /// the caller takes its database key from `data_key`. The keys app's older path returns a
+    /// `databaseKey` and `unlocked` instead of `seed`. Tier B.
     fn request_open(&self, params_json: String) -> String;
     /// Ask for an account to stay unlocked: `{ account, ttlMs?, count?, apps?, confirm?, reason? }`
     /// → `{ ok, handle, receipt, state }`. The person decides the terms. Tier B.
     fn request_unlock(&self, params_json: String) -> String;
-    /// The custodian's queue: `{ ok, requests: [{ handle, requester, kind, state, ageMs }] }`. Tier D.
+    /// The queue: `{ ok, requests: [{ handle, requester, kind, state, ageMs, seed }] }`, `seed` the
+    /// wallet an open names when known; an approver sees opens only. Approvers and the custodian.
     fn access_requests(&self) -> String;
-    /// Claim one for display: `{ ok, handle, requester, kind, bundle_id, lines, asked }`. `asked` is
-    /// `{ group, family, network, unlock }` for an open and `{ account, terms }` for an unlock. Tier D.
+    /// Claim one for display: `{ ok, handle, requester, kind, bundle_id, lines, asked, seed }`.
+    /// `asked` is `{ group, family, network, unlock, seed }` for an open and `{ account, terms }` for
+    /// an unlock; `seed` is the named wallet's. The first app to claim it keeps it.
     fn acknowledge_access(&self, handle: String) -> String;
-    /// The person decided: `{ handle, bundle_id, group?, password, unlock?, birthday? }` → `{ ok }`,
-    /// or `{ ok: false, code: "wrong_secret" }` with the request left on screen. For a device
-    /// account the password is its database key's, set at its first open with the `birthday`. Tier D.
+    /// The person decided: an approver's consent `{ handle, bundle_id, group? }`, once the wallet is
+    /// unlocked (`code: locked` until then), or the custodian's `{ handle, bundle_id, group?,
+    /// password, unlock?, birthday? }` → `{ ok }`, or `{ ok: false, code }` with the request left on
+    /// screen.
     fn approve_access(&self, params_json: String) -> String;
-    /// The person said no. Tier D.
+    /// The person said no: the app that claimed it.
     fn reject_access(&self, handle: String) -> bool;
     /// An open wallet's descriptors again: `{ ok, group, external, internal }`, only for a module
     /// the wallet is open for.
@@ -106,6 +116,52 @@ pub trait SignerManagerModule: Send + Sync + 'static {
     /// Requests signed without being shown: `{ ok, signed: [{ handle, requester, account, ageMs }] }`.
     /// Approver and custodian.
     fn unattended_signatures(&self) -> String;
+
+    // ── Wallets: each seed unlocked once per session, in the Signer app ─────
+    /// Every wallet: `{ ok, wallets: [{ seed, name, locked, kinds, privateName? }] }`. Tier B.
+    fn wallets(&self) -> String;
+    /// The caller's own key for a wallet's data: `{ seed, scope, generation? }`, `seed` a wallet's
+    /// or `"profile"` → `{ ok, key, generation }`, or `code: locked`. Tier B: a module gets only
+    /// keys of its own.
+    fn data_key(&self, params_json: String) -> String;
+    /// A signer registers the seed it just added, with the holder's unlock key at index 0 when it
+    /// gives one: `{ seed, kind, unlockKey?, name, origin?, birthday? }` → `{ ok, seed, new,
+    /// unlocked }`. `seed` in is the signer's own name for it. The configured signers only.
+    fn enroll_seed(&self, params_json: String) -> String;
+    /// The Signer app's view: `{ ok, wallets: [{ seed, name, privateName?, locked, holders, device,
+    /// index, generation, ways: [{ id, factors: [{ kind, id?, name? }] }], alwaysUnlocked, origin?,
+    /// birthday? }],
+    /// passwords: [{ id, name, wallets }] }`. `device`: its holders give an unlock key, so a way
+    /// may take the device. Approvers.
+    fn wallet_settings(&self) -> String;
+    /// Unlock a wallet by one of its ways in: `{ seed, way, holder?, secret?, passwords? }`, or `{
+    /// handle, passwords }` to type a password again → `{ ok, state: "done" }`, or `{ ok, state:
+    /// "device", handle }` while the holder works. `passwords` maps a password's id to it. Approvers.
+    fn unlock_wallet(&self, params_json: String) -> String;
+    /// How a device step stands: `{ ok, state, seed, step?, code?, error? }`, `state` one of
+    /// `device`, `needs_password`, `done`, `failed`. Approvers.
+    fn unlock_progress(&self, handle: String) -> String;
+    /// Stop a device step: the holder stops asking. Approvers.
+    fn cancel_unlock(&self, handle: String) -> bool;
+    /// `{ seeds? }`, every wallet for `{}` → `{ ok, locked }`. Approvers.
+    fn lock_wallets(&self, params_json: String) -> String;
+    /// A wallet's ways in: `{ seed, ways: [[factor]], holder?, secret?, passwords? }`, each factor
+    /// `device` or `password:<id>` → as `unlock_wallet`; `[[]]` alone leaves it always unlocked.
+    /// Approvers.
+    fn set_rule(&self, params_json: String) -> String;
+    /// New keys for a wallet: `{ seed, newIndex?, holder?, secret?, passwords? }`; `newIndex: true`
+    /// moves to the next unlock key → as `unlock_wallet`. Approvers.
+    fn change_keys(&self, params_json: String) -> String;
+    /// `{ seed, name?, privateName? }` → `{ ok }`; an empty `privateName` clears it. Approvers.
+    fn set_names(&self, params_json: String) -> String;
+    /// `{ name, password }` → `{ ok, id }`. Approvers.
+    fn create_password(&self, params_json: String) -> String;
+    /// `{ id, name }` → `{ ok }`. Approvers.
+    fn rename_password(&self, params_json: String) -> String;
+    /// `{ id, old, new }` → `{ ok }`. Approvers.
+    fn change_password(&self, params_json: String) -> String;
+    /// `{ id }` → `{ ok }`, refused while a wallet's rule takes it. Approvers.
+    fn remove_password(&self, params_json: String) -> String;
 
     // ── Tier C: ungated reads ───────────────────────────────────────────
     /// Every signer's accounts, each under the first signer that offers it: `{ ok, accounts: [{
@@ -139,6 +195,10 @@ pub trait SignerManagerModuleEvents {
     fn unlock_changed(&self, account: String);
     /// A request was signed without being shown, inside an unlock that allows it.
     fn signed_without_asking(&self, handle: String);
+    /// A wallet was added, unlocked or changed: re-read `wallets`, and ask `data_key` again.
+    fn wallets_changed(&self, seed: String);
+    /// Wallets were locked: drop what was read under their keys.
+    fn wallets_locked(&self, count: i64);
 }
 
 include!(concat!(env!("CARGO_MANIFEST_DIR"), "/generated/provider_gen.rs"));
@@ -175,6 +235,7 @@ impl Signer for IpcSigner {
                 request_kinds: Vec::new(),
                 shows_request: false,
                 collects: logos_signer_interface::Collects::Nothing,
+                unlock_key: false,
             })
     }
 
@@ -232,6 +293,41 @@ impl Signer for IpcSigner {
     fn cancel(&mut self, job: &str) -> logos_signer_interface::Result<()> {
         let reply = signer::SignerClient::bind(&self.name)
             .cancel_sign_with_timeout(job, SIGNER_TIMEOUT)
+            .map_err(|e| unavailable(&self.name, e))?;
+        signer_json::read_job(&reply).map(drop)
+    }
+
+    fn unlock_key(&mut self, request: UnlockKeyRequest) -> logos_signer_interface::Result<String> {
+        let mut value = serde_json::to_value(request).map_err(|e| unavailable(&self.name, e))?;
+        let body = Zeroizing::new(value.to_string());
+        if let Some(serde_json::Value::String(secret)) = value.get_mut("secret") {
+            zeroize::Zeroize::zeroize(secret);
+        }
+        drop(value);
+        let reply = signer::SignerClient::bind(&self.name)
+            .unlock_key_with_timeout(&body, SIGNER_TIMEOUT).map_err(|e| unavailable(&self.name, e))?;
+        signer_json::read_job(&reply)
+    }
+
+    fn unlock_key_status(&mut self, job: &str) -> logos_signer_interface::Result<JobStatus> {
+        let reply = signer::SignerClient::bind(&self.name)
+            .unlock_key_status_with_timeout(job, SIGNER_TIMEOUT)
+            .map_err(|e| unavailable(&self.name, e))?;
+        signer_json::read_status(&reply)
+    }
+
+    fn unlock_key_result(&mut self, job: &str) -> logos_signer_interface::Result<UnlockKey> {
+        let reply = Zeroizing::new(
+            signer::SignerClient::bind(&self.name)
+                .unlock_key_result_with_timeout(job, SIGNER_TIMEOUT)
+                .map_err(|e| unavailable(&self.name, e))?,
+        );
+        signer_json::read_unlock_key(&reply)
+    }
+
+    fn cancel_unlock_key(&mut self, job: &str) -> logos_signer_interface::Result<()> {
+        let reply = signer::SignerClient::bind(&self.name)
+            .cancel_unlock_key_with_timeout(job, SIGNER_TIMEOUT)
             .map_err(|e| unavailable(&self.name, e))?;
         signer_json::read_job(&reply).map(drop)
     }
@@ -331,6 +427,7 @@ impl SignerManagerModuleImpl {
 struct Core {
     approvals: Approvals,
     access: Access,
+    wallets: Wallets,
     unattended: Vec<Unattended>,
     roles: gate::Roles,
     signers: Registry,
@@ -455,14 +552,86 @@ impl Core {
                 Move::Rendered(h) => emit_approval_progress(&h, "rendered"),
             }
         }
+        // So does a holder working out an unlock key; its jobs are announced nowhere, so this looks.
+        self.wallets.progress_all(&mut self.signers);
+        self.announce_wallets();
+    }
+
+    fn announce_wallets(&mut self) {
+        for seed in self.wallets.drain_changed() {
+            emit_wallets_changed(&seed);
+        }
+    }
+
+    /// The access gate for the caller: the custodian, else an approver.
+    fn access_gate(&self) -> Option<(String, Role)> {
+        let name = self.named_caller()?;
+        let role = if self.is_custodian() {
+            Role::Custodian
+        } else if self.is_approver() {
+            Role::Approver
+        } else {
+            return None;
+        };
+        Some((name, role))
     }
 }
 
+/// A device step's reply: done, or the handle `unlock_progress` follows.
+fn begun(r: crate::Result<Begun>) -> String {
+    match r {
+        Ok(Begun::Done) => json!({ "ok": true, "state": "done" }).to_string(),
+        Ok(Begun::Waiting(handle)) => json!({ "ok": true, "state": "device", "handle": handle }).to_string(),
+        Err(e) => manager_err(&e),
+    }
+}
+
+/// What a step that may need the device carries: the holder, its PIN or password, typed passwords.
+#[derive(serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct StepWire {
+    #[serde(default)]
+    holder: Option<String>,
+    #[serde(default)]
+    secret: Option<String>,
+    #[serde(default)]
+    passwords: std::collections::BTreeMap<String, String>,
+}
+
+impl StepWire {
+    fn take(&mut self) -> (Option<String>, Option<logos_signer_interface::Secret>, std::collections::BTreeMap<String, Zeroizing<String>>) {
+        let passwords = std::mem::take(&mut self.passwords).into_iter().map(|(id, pw)| (id, Zeroizing::new(pw))).collect();
+        (self.holder.take(), self.secret.take().map(logos_signer_interface::Secret::new), passwords)
+    }
+}
+
+/// Parse params that carry a secret; the buffer is wiped whatever the outcome.
+fn secret_params<T: serde::de::DeserializeOwned>(params_json: String) -> Result<T, String> {
+    let owned = Zeroizing::new(params_json);
+    serde_json::from_str(&owned).map_err(|e| e.to_string())
+}
+
 impl Core {
-    fn on_context_ready(&mut self, _ctx: &RustModuleContext) {
+    fn on_context_ready(&mut self, ctx: &RustModuleContext) {
+        let dir = std::path::Path::new(&ctx.instance_persistence_path).join("unlock");
+        self.wallets = Wallets::new(Unlock::load(dir));
         self.bind_signers();
         // The terms of any unlock were kept here and are gone: nothing stays unlocked past a restart.
         let _ = KeystoreKeys.lock(None);
+        // An always-unlocked wallet is open from the start, but a module loaded before this one
+        // hears of it only once its subscription arms: say so again then.
+        let me = self.me.clone();
+        std::thread::spawn(move || {
+            for wait in [3, 15] {
+                std::thread::sleep(Duration::from_secs(wait));
+                let Some(core) = me.upgrade() else { return };
+                let mut core = core.lock().unwrap_or_else(|e| e.into_inner());
+                for w in core.wallets.store.wallets().into_iter().filter(|w| !w.locked) {
+                    core.wallets.note(&w.seed);
+                }
+                core.refresh();
+            }
+        });
     }
 
     fn configure(&mut self, config_json: String) -> String {
@@ -680,7 +849,7 @@ impl Core {
             return not_authorized();
         };
         self.refresh();
-        match self.access.request_open(&mut self.signers, &requester, &params_json) {
+        match self.access.request_open(&mut self.signers, &self.wallets.store, &requester, &params_json) {
             Ok((handle, receipt)) => {
                 emit_access_requested(&handle);
                 json!({ "ok": true, "handle": handle, "receipt": receipt, "state": "offered" }).to_string()
@@ -704,36 +873,40 @@ impl Core {
     }
 
     fn access_requests(&mut self) -> String {
-        if !self.is_custodian() {
+        let Some((_, role)) = self.access_gate() else {
             return not_authorized();
-        }
+        };
+        self.refresh();
         let list: Vec<_> = self
             .access
-            .queue()
+            .queue(&mut self.signers, &self.wallets.store, role)
             .into_iter()
             .map(|q| json!({ "handle": q.handle, "requester": q.requester, "kind": q.kind, "state": q.state,
-                             "ageMs": q.age_ms as u64 }))
+                             "ageMs": q.age_ms as u64, "seed": q.seed }))
             .collect();
         json!({ "ok": true, "requests": list }).to_string()
     }
 
     fn acknowledge_access(&mut self, handle: String) -> String {
-        if !self.is_custodian() {
+        let Some((name, role)) = self.access_gate() else {
             return not_authorized();
-        }
-        match self.access.acknowledge(&handle) {
+        };
+        self.refresh();
+        let gate = Gate { caller: &name, role };
+        match self.access.acknowledge(&mut self.signers, &self.wallets.store, &handle, &gate) {
             Ok(v) => json!({ "ok": true, "handle": v.handle, "requester": v.requester, "kind": v.kind,
-                             "bundle_id": v.bundle_id, "lines": v.lines, "asked": v.asked })
+                             "bundle_id": v.bundle_id, "lines": v.lines, "asked": v.asked, "seed": v.seed })
             .to_string(),
+            Err(ManagerError::Refused(_)) | Err(ManagerError::NotFound(_)) => not_authorized(),
             Err(e) => err(e),
         }
     }
 
     fn approve_access(&mut self, params_json: String) -> String {
         let params_json = Zeroizing::new(params_json);
-        if !self.is_custodian() {
+        let Some((name, role)) = self.access_gate() else {
             return not_authorized();
-        }
+        };
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Wire {
@@ -741,7 +914,9 @@ impl Core {
             bundle_id: String,
             #[serde(default)]
             group: Option<String>,
-            password: String,
+            /// The custodian's path; an approver's consent carries none.
+            #[serde(default)]
+            password: Option<String>,
             #[serde(default)]
             unlock: Option<Terms>,
             /// A device wallet's first day of use, at its first open.
@@ -752,10 +927,21 @@ impl Core {
             Ok(w) => w,
             Err(e) => return err(format!("approve_access: {e}")),
         };
-        let birthday = w.birthday.map(|b| b.trim().to_string()).filter(|b| !b.is_empty());
-        let decision = Decision { group: w.group, password: w.password, unlock: w.unlock, birthday };
         self.refresh();
-        match self.access.approve(&mut self.signers, &mut KeystoreKeys, &w.handle, &w.bundle_id, decision) {
+        // A module holding both roles gives consent unless it brings the keystore's password.
+        let consent = w.password.is_none() && (role == Role::Approver || self.is_approver());
+        let decided = if consent {
+            let gate = Gate { caller: &name, role: Role::Approver };
+            self.access.consent(&mut self.signers, &self.wallets.store, &w.handle, &w.bundle_id, w.group, &gate)
+        } else {
+            let birthday = w.birthday.map(|b| b.trim().to_string()).filter(|b| !b.is_empty());
+            let password = w.password.unwrap_or_default();
+            let decision = Decision { group: w.group, password, unlock: w.unlock, birthday };
+            let gate = Gate { caller: &name, role };
+            self.access.approve(&mut self.signers, &mut KeystoreKeys, &w.handle, &w.bundle_id, decision, &gate)
+        };
+        match decided {
+            Err(ManagerError::Refused(why)) if why == "not authorized" => not_authorized(),
             Ok(()) => {
                 emit_access_settled(&w.handle, "approved");
                 json!({ "ok": true }).to_string()
@@ -765,10 +951,10 @@ impl Core {
     }
 
     fn reject_access(&mut self, handle: String) -> bool {
-        if !self.is_custodian() {
+        let Some((name, role)) = self.access_gate() else {
             return false;
-        }
-        let ok = self.access.reject(&handle).is_ok();
+        };
+        let ok = self.access.reject(&handle, &Gate { caller: &name, role }).is_ok();
         if ok {
             emit_access_settled(&handle, "rejected");
         }
@@ -930,10 +1116,13 @@ impl Core {
         self.refresh();
         let roster = self.signers.roster();
         let snapshots = self.origins.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let store = &self.wallets.store;
         let list: Vec<_> = roster
             .iter()
             .map(|(key, holders)| {
-                crate::roster::entry_json(key, holders, |f| crate::origins::of(&snapshots, &f.name, &f.account))
+                let mut e = crate::roster::entry_json(key, holders, |f| crate::origins::of(&snapshots, &f.name, &f.account));
+                e["seed"] = holders.iter().find_map(|f| store.seed_of(&f.name, f.account.seed.as_deref()?)).into();
+                e
             })
             .collect();
         json!({ "ok": true, "accounts": list }).to_string()
@@ -944,6 +1133,381 @@ impl Core {
         let list: Vec<_> =
             self.signers.infos().into_iter().map(|(name, info)| json!({ "name": name, "info": info })).collect();
         json!({ "ok": true, "signers": list }).to_string()
+    }
+
+    fn is_signer(&self) -> Option<String> {
+        self.named_caller().filter(|n| self.roles.signers.iter().any(|s| s == n))
+    }
+
+    // These two answer signers and data owners mid-call, while the caller may be waiting on its
+    // own reply: they must not call out to any module, so neither refreshes.
+    fn data_key(&mut self, params_json: String) -> String {
+        let Some(module) = self.named_caller() else {
+            return not_authorized();
+        };
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            #[serde(default)]
+            seed: String,
+            #[serde(default)]
+            account: Option<String>,
+            scope: String,
+            #[serde(default)]
+            generation: Option<u32>,
+        }
+        let w: Wire = match serde_json::from_str(&params_json) {
+            Ok(w) => w,
+            Err(e) => return err(format!("data_key: {e}")),
+        };
+        let seed = match (&w.account, w.seed.trim().is_empty()) {
+            (Some(account), true) => match self.signers.seed_of_account(account) {
+                Some((holder, named)) => match self.wallets.store.seed_of(&holder, &named) {
+                    Some(seed) => seed,
+                    None => return json!({ "ok": false, "code": "unavailable", "error": "data_key: this account's wallet isn't known yet" }).to_string(),
+                },
+                None => return json!({ "ok": false, "code": "unavailable", "error": "data_key: no signer lists this account" }).to_string(),
+            },
+            (None, false) => self.wallets.store.resolve(&module, &w.seed),
+            _ => return err("data_key: name a seed or an account"),
+        };
+        match self.wallets.store.data_key(&module, &seed, &w.scope, w.generation) {
+            Ok((key, generation)) => {
+                let key = Zeroizing::new(hex::encode(&key[..]));
+                json!({ "ok": true, "key": key.as_str(), "generation": generation, "seed": seed }).to_string()
+            }
+            Err(e) => manager_err(&e),
+        }
+    }
+
+    fn enroll_seed(&mut self, params_json: String) -> String {
+        let Some(signer) = self.is_signer() else {
+            return not_authorized();
+        };
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Wire {
+            seed: String,
+            #[serde(default)]
+            kind: String,
+            #[serde(default)]
+            unlock_key: Option<String>,
+            name: String,
+            #[serde(default)]
+            origin: Option<String>,
+            #[serde(default)]
+            birthday: Option<String>,
+        }
+        let w: Wire = match secret_params(params_json) {
+            Ok(w) => w,
+            Err(e) => return err(format!("enroll_seed: {e}")),
+        };
+        let key = match w.unlock_key.map(Zeroizing::new).as_deref().map(|k| hex::decode(k.trim())) {
+            Some(Ok(bytes)) => Some(Zeroizing::new(bytes)),
+            Some(Err(_)) => return err("enroll_seed: unlockKey is not hex"),
+            None => None,
+        };
+        let holder = Holder { signer, seed: w.seed, kind: w.kind };
+        let about = About { private_name: None, origin: w.origin, birthday: w.birthday };
+        match self.wallets.store.enroll(holder, key.as_ref().map(|k| k.as_slice()), &w.name, about) {
+            Ok(e) => {
+                self.wallets.note(&e.seed);
+                self.announce_wallets();
+                json!({ "ok": true, "seed": e.seed, "new": e.new, "unlocked": e.unlocked }).to_string()
+            }
+            Err(e) => manager_err(&e),
+        }
+    }
+
+    fn wallets(&mut self) -> String {
+        if self.named_caller().is_none() {
+            return not_authorized();
+        }
+        let list: Vec<_> = self
+            .wallets
+            .store
+            .wallets()
+            .into_iter()
+            .map(|w| {
+                let mut kinds: Vec<String> = w.holders.iter().map(|h| h.kind.clone()).collect();
+                kinds.dedup();
+                json!({ "seed": w.seed, "name": w.name, "locked": w.locked, "kinds": kinds,
+                        "privateName": w.about.private_name })
+            })
+            .collect();
+        json!({ "ok": true, "wallets": list }).to_string()
+    }
+
+    fn wallet_settings(&mut self) -> String {
+        if !self.is_approver() {
+            return not_authorized();
+        }
+        let store = &self.wallets.store;
+        let factor = |f: &Factor| match f {
+            Factor::Device => json!({ "kind": "device" }),
+            Factor::Password(id) => json!({ "kind": "password", "id": id, "name": store.password_name(id) }),
+        };
+        let wallets: Vec<_> = store
+            .wallets()
+            .into_iter()
+            .map(|w| {
+                let ways: Vec<_> = w
+                    .ways
+                    .iter()
+                    .map(|(id, factors)| json!({ "id": id, "factors": factors.iter().map(factor).collect::<Vec<_>>() }))
+                    .collect();
+                let always = w.ways.iter().any(|(_, f)| f.is_empty());
+                json!({ "seed": w.seed, "name": w.name, "privateName": w.about.private_name, "locked": w.locked,
+                        "holders": w.holders, "device": w.device, "index": w.index, "generation": w.generation,
+                        "ways": ways, "alwaysUnlocked": always, "origin": w.about.origin, "birthday": w.about.birthday })
+            })
+            .collect();
+        let passwords: Vec<_> = store
+            .passwords()
+            .into_iter()
+            .map(|(id, name, used)| json!({ "id": id, "name": name, "wallets": used }))
+            .collect();
+        json!({ "ok": true, "wallets": wallets, "passwords": passwords }).to_string()
+    }
+
+    fn unlock_wallet(&mut self, params_json: String) -> String {
+        if !self.is_approver() {
+            return not_authorized();
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Wire {
+            #[serde(default)]
+            seed: String,
+            #[serde(default)]
+            way: String,
+            #[serde(default)]
+            handle: Option<String>,
+            #[serde(flatten)]
+            step: StepWire,
+        }
+        let mut w: Wire = match secret_params(params_json) {
+            Ok(w) => w,
+            Err(e) => return err(format!("unlock_wallet: {e}")),
+        };
+        self.refresh();
+        let (holder, secret, passwords) = w.step.take();
+        let r = match w.handle {
+            Some(h) => self.wallets.retry(&h, passwords),
+            None => {
+                let then = Then::Unlock { way: w.way };
+                self.wallets.begin(&mut self.signers, &w.seed, then, holder.as_deref(), secret, passwords)
+            }
+        };
+        let reply = begun(r);
+        self.announce_wallets();
+        reply
+    }
+
+    fn unlock_progress(&mut self, handle: String) -> String {
+        if !self.is_approver() {
+            return not_authorized();
+        }
+        self.refresh();
+        match self.wallets.progress(&mut self.signers, &handle) {
+            Ok(mut v) => {
+                v["ok"] = true.into();
+                v.to_string()
+            }
+            Err(_) => not_authorized(),
+        }
+    }
+
+    fn cancel_unlock(&mut self, handle: String) -> bool {
+        self.is_approver() && self.wallets.cancel(&mut self.signers, &handle).is_ok()
+    }
+
+    fn lock_wallets(&mut self, params_json: String) -> String {
+        if !self.is_approver() {
+            return not_authorized();
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            #[serde(default)]
+            seeds: Option<Vec<String>>,
+        }
+        let w: Wire = match serde_json::from_str(&params_json) {
+            Ok(w) => w,
+            Err(e) => return err(format!("lock_wallets: {e}")),
+        };
+        let locked = self.wallets.lock(&mut self.signers, w.seeds.as_deref());
+        // Their signers drop the accounts they read under those keys: read them again.
+        self.signers.forget(&self.roles.signers.clone());
+        emit_wallets_locked(locked as i64);
+        json!({ "ok": true, "locked": locked }).to_string()
+    }
+
+    fn set_rule(&mut self, params_json: String) -> String {
+        if !self.is_approver() {
+            return not_authorized();
+        }
+        #[derive(serde::Deserialize)]
+        struct Wire {
+            seed: String,
+            ways: Vec<Vec<String>>,
+            #[serde(flatten)]
+            step: StepWire,
+        }
+        let mut w: Wire = match secret_params(params_json) {
+            Ok(w) => w,
+            Err(e) => return err(format!("set_rule: {e}")),
+        };
+        let ways: crate::Result<Vec<Vec<Factor>>> =
+            w.ways.iter().map(|way| way.iter().map(|f| Factor::parse(f)).collect()).collect();
+        let ways = match ways {
+            Ok(ways) => ways,
+            Err(e) => return manager_err(&e),
+        };
+        self.refresh();
+        let (holder, secret, passwords) = w.step.take();
+        let then = Then::SetRule { ways };
+        let reply = begun(self.wallets.begin(&mut self.signers, &w.seed, then, holder.as_deref(), secret, passwords));
+        self.announce_wallets();
+        reply
+    }
+
+    fn change_keys(&mut self, params_json: String) -> String {
+        if !self.is_approver() {
+            return not_authorized();
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Wire {
+            seed: String,
+            #[serde(default)]
+            new_index: bool,
+            #[serde(flatten)]
+            step: StepWire,
+        }
+        let mut w: Wire = match secret_params(params_json) {
+            Ok(w) => w,
+            Err(e) => return err(format!("change_keys: {e}")),
+        };
+        let new_index = match (w.new_index, self.wallets.store.index(&w.seed)) {
+            (false, _) => None,
+            (true, Ok(i)) => Some(i + 1),
+            (true, Err(e)) => return manager_err(&e),
+        };
+        self.refresh();
+        let (holder, secret, passwords) = w.step.take();
+        let then = Then::ChangeKeys { new_index };
+        let reply = begun(self.wallets.begin(&mut self.signers, &w.seed, then, holder.as_deref(), secret, passwords));
+        self.announce_wallets();
+        reply
+    }
+
+    fn set_names(&mut self, params_json: String) -> String {
+        if !self.is_approver() {
+            return not_authorized();
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Wire {
+            seed: String,
+            #[serde(default)]
+            name: Option<String>,
+            #[serde(default)]
+            private_name: Option<String>,
+        }
+        let w: Wire = match serde_json::from_str(&params_json) {
+            Ok(w) => w,
+            Err(e) => return err(format!("set_names: {e}")),
+        };
+        let private = w.private_name.as_deref().map(|p| Some(p).filter(|p| !p.trim().is_empty()));
+        match self.wallets.store.set_names(&w.seed, w.name.as_deref(), private) {
+            Ok(()) => {
+                self.wallets.note(&w.seed);
+                self.announce_wallets();
+                json!({ "ok": true }).to_string()
+            }
+            Err(e) => manager_err(&e),
+        }
+    }
+
+    fn create_password(&mut self, params_json: String) -> String {
+        if !self.is_approver() {
+            return not_authorized();
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            name: String,
+            password: String,
+        }
+        let w: Wire = match secret_params(params_json) {
+            Ok(w) => w,
+            Err(e) => return err(format!("create_password: {e}")),
+        };
+        let password = Zeroizing::new(w.password);
+        match self.wallets.store.create_password(&w.name, &password) {
+            Ok(id) => json!({ "ok": true, "id": id }).to_string(),
+            Err(e) => manager_err(&e),
+        }
+    }
+
+    fn rename_password(&mut self, params_json: String) -> String {
+        if !self.is_approver() {
+            return not_authorized();
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            id: String,
+            name: String,
+        }
+        match serde_json::from_str::<Wire>(&params_json) {
+            Ok(w) => match self.wallets.store.rename_password(&w.id, &w.name) {
+                Ok(()) => json!({ "ok": true }).to_string(),
+                Err(e) => manager_err(&e),
+            },
+            Err(e) => err(format!("rename_password: {e}")),
+        }
+    }
+
+    fn change_password(&mut self, params_json: String) -> String {
+        if !self.is_approver() {
+            return not_authorized();
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            id: String,
+            old: String,
+            new: String,
+        }
+        let w: Wire = match secret_params(params_json) {
+            Ok(w) => w,
+            Err(e) => return err(format!("change_password: {e}")),
+        };
+        let (old, new) = (Zeroizing::new(w.old), Zeroizing::new(w.new));
+        match self.wallets.store.change_password(&w.id, &old, &new) {
+            Ok(()) => json!({ "ok": true }).to_string(),
+            Err(e) => manager_err(&e),
+        }
+    }
+
+    fn remove_password(&mut self, params_json: String) -> String {
+        if !self.is_approver() {
+            return not_authorized();
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            id: String,
+        }
+        match serde_json::from_str::<Wire>(&params_json) {
+            Ok(w) => match self.wallets.store.remove_password(&w.id) {
+                Ok(()) => json!({ "ok": true }).to_string(),
+                Err(e) => manager_err(&e),
+            },
+            Err(e) => err(format!("remove_password: {e}")),
+        }
     }
 
     fn caller_identity(&mut self) -> String {
@@ -1081,6 +1645,66 @@ impl SignerManagerModule for SignerManagerModuleImpl {
 
     fn caller_identity(&self) -> String {
         self.core().caller_identity()
+    }
+
+    fn wallets(&self) -> String {
+        self.core().wallets()
+    }
+
+    fn data_key(&self, params_json: String) -> String {
+        self.core().data_key(params_json)
+    }
+
+    fn enroll_seed(&self, params_json: String) -> String {
+        self.core().enroll_seed(params_json)
+    }
+
+    fn wallet_settings(&self) -> String {
+        self.core().wallet_settings()
+    }
+
+    fn unlock_wallet(&self, params_json: String) -> String {
+        self.core().unlock_wallet(params_json)
+    }
+
+    fn unlock_progress(&self, handle: String) -> String {
+        self.core().unlock_progress(handle)
+    }
+
+    fn cancel_unlock(&self, handle: String) -> bool {
+        self.core().cancel_unlock(handle)
+    }
+
+    fn lock_wallets(&self, params_json: String) -> String {
+        self.core().lock_wallets(params_json)
+    }
+
+    fn set_rule(&self, params_json: String) -> String {
+        self.core().set_rule(params_json)
+    }
+
+    fn change_keys(&self, params_json: String) -> String {
+        self.core().change_keys(params_json)
+    }
+
+    fn set_names(&self, params_json: String) -> String {
+        self.core().set_names(params_json)
+    }
+
+    fn create_password(&self, params_json: String) -> String {
+        self.core().create_password(params_json)
+    }
+
+    fn rename_password(&self, params_json: String) -> String {
+        self.core().rename_password(params_json)
+    }
+
+    fn change_password(&self, params_json: String) -> String {
+        self.core().change_password(params_json)
+    }
+
+    fn remove_password(&self, params_json: String) -> String {
+        self.core().remove_password(params_json)
     }
 }
 

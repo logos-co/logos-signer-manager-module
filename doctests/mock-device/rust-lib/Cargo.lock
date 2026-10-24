@@ -380,7 +380,7 @@ dependencies = [
 [[package]]
 name = "logos-signer-interface"
 version = "0.1.0"
-source = "git+https://github.com/logos-co/logos-signer-interface?rev=3b4542f4705a070bcc2d174cff6d9c8695248133#3b4542f4705a070bcc2d174cff6d9c8695248133"
+source = "git+https://github.com/logos-co/logos-signer-interface?rev=752b7bd69a79ead110efccab40a64731535187f5#752b7bd69a79ead110efccab40a64731535187f5"
 dependencies = [
  "bip32",
  "bitcoin",
