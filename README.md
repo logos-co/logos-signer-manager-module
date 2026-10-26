@@ -25,7 +25,7 @@ installed. Those three are optional dependencies, so installed ones load with th
 
 See [`docs/specs.md`](docs/specs.md) for the reference, and
 [`doctests/signer-manager-runtime.test.yaml`](doctests/signer-manager-runtime.test.yaml) for the
-round trip through `logoscore`.
+round trip through `logosctl`.
 
 ```sh
 cd rust-lib && cargo test --no-default-features

@@ -8,11 +8,11 @@ intro: |
   signs for keys kept in files, behind the signer interface every signer implements, and the
   manager checks every signature before anyone can collect it.
 
-  This doc-test runs the whole round trip headlessly through `logoscore`. A small fixture module,
+  This doc-test runs the whole round trip headlessly through `logosctl`. A small fixture module,
   `manager_probe`, plays three parts the apps play in Basecamp: the keystore's custodian, a
   requester, and the manager's approver. Everything is offline and deterministic.
 
-what_you_build: "The signer manager and the keystore, installed with `lgpm` and driven through a `logoscore` daemon."
+what_you_build: "The signer manager and the keystore, installed into and driven through a `logosctl` daemon."
 
 what_you_learn:
   - How the manager finds an account's signer through the signer interface
@@ -25,22 +25,19 @@ prerequisites:
   - "**A Linux or macOS machine.** Everything here is offline."
 
 sections:
-  - title: "Build logoscore and lgpm"
+  - title: "Build logosctl"
     step: true
     steps:
-      - title: "Build logoscore"
-        run: "nix build 'github:logos-co/logos-logoscore-cli#cli' --out-link ./logos"
-        check_file: "logos/bin/logoscore"
+      - title: "Build logosctl"
+        run: "nix build 'github:logos-co/logos-logoscore-cli#ctl' --out-link ./logos"
+        check_file: "logos/bin/logosctl"
       - title: "Prove the CLI runs"
-        run: "./logos/bin/logoscore --version"
-        code_block: "logoscore --version"
+        run: "./logos/bin/logosctl --version"
+        code_block: "logosctl --version"
         expect_contains:
-          - "logoscore version"
-      - title: "Build lgpm"
-        run: "nix build 'github:logos-co/logos-package-manager#cli' -o lgpm"
-        check_file: "lgpm/bin/lgpm"
+          - "logosctl version"
 
-  - title: "Build and install the modules"
+  - title: "Build the modules"
     step: true
     text: |
       The keystore is pinned to the commit that made it a signer. The probe is a subflake of the
@@ -60,36 +57,37 @@ sections:
           nix build './doctests/mock-device#lgx' -o device-lgx      # a signer that behaves like a device
         expect_contains:
           - "manager_probe"
-      - title: "Install them"
-        run: |
-          mkdir -p modules
-          cp -RL ./logos/modules/. ./modules/
-          chmod -R u+w modules
-          ./lgpm/bin/lgpm --modules-dir ./modules --allow-unsigned install --file keystore-lgx/*.lgx
-          ./lgpm/bin/lgpm --modules-dir ./modules --allow-unsigned install --file manager-lgx/*.lgx
-          ./lgpm/bin/lgpm --modules-dir ./modules --allow-unsigned install --file probe-lgx/*.lgx
-          ./lgpm/bin/lgpm --modules-dir ./modules --allow-unsigned install --file device-lgx/*.lgx
-          ./lgpm/bin/lgpm --modules-dir ./modules list
-        expect_contains:
-          - "keystore_module"
-          - "signer_manager_module"
-          - "manager_probe"
-          - "mock_device_signer"
 
   - title: "Run the daemon and name the roles"
     step: true
     steps:
       - title: "Start the daemon"
-        run: "sh -c './logos/bin/logoscore -D -m ./modules > logs.txt 2>&1 &'"
-        code_block: "logoscore -D -m ./modules > logs.txt &"
-      - run: "sleep 3"
+        # The bundled package downloader starts a storage node in $HOME; keep it out of the real one.
+        run: "mkdir -p home && HOME=\"$PWD/home\" ./logos/bin/logosctl --config-dir ./session daemon start --detach"
+        code_block: "logosctl daemon start --detach"
+        expect_contains:
+          - "Daemon started"
+      - title: "Install them"
+        text: |
+          Copy the packages into `./packages` and install them all into the daemon's session. They are
+          unsigned local builds, which the default signature policy accepts with a warning.
+        run: |
+          mkdir -p packages && cp -f *-lgx/*.lgx packages/
+          ./logos/bin/logosctl --config-dir ./session install --dir packages -y
+          ./logos/bin/logosctl --config-dir ./session package ls
+        code_block: "logosctl install --dir packages -y"
+        expect_contains:
+          - "keystore_module"
+          - "signer_manager_module"
+          - "manager_probe"
+          - "mock_device_signer"
       - title: "Load the probe, which loads the manager and the keystore"
         text: |
           The Keycard and QR signer modules are the manager's optional dependencies: installed ones
           load with it. None is installed here, so the load reports each as skipped and succeeds
           without them.
-        run: "./logos/bin/logoscore load-module manager_probe"
-        code_block: "logoscore load-module manager_probe"
+        run: "./logos/bin/logosctl --config-dir ./session module load manager_probe"
+        code_block: "logosctl module load manager_probe"
         expect_contains:
           - "signer_manager_module"
           - "keystore_module"
@@ -101,8 +99,8 @@ sections:
           With nothing configured, the manager consults the keystore, then the Keycard Shell's, the
           bare Keycard's and the QR signer's modules. No device module is installed here, so each
           offers nothing.
-        run: "./logos/bin/logoscore call signer_manager_module signers"
-        code_block: "logoscore call signer_manager_module signers"
+        run: "./logos/bin/logosctl --config-dir ./session call signer_manager_module signers"
+        code_block: "logosctl call signer_manager_module signers"
         expect_contains:
           - '\"kind\":\"keystore\"'
           - '\"info\":null,\"name\":\"keycard_shell_module\"'
@@ -114,17 +112,17 @@ sections:
           The manager's approver is what the signer app is in Basecamp, its custodian what the keys
           app is, and its signers the modules it consults. Here the probe plays every app.
         run: |
-          ./logos/bin/logoscore call keystore_module configure '{"approvers":"evm_signer_ui","custodians":"manager_probe","managers":"signer_manager_module"}'
-          ./logos/bin/logoscore call signer_manager_module configure '{"approvers":"manager_probe","custodians":"manager_probe","signers":"keystore_module"}'
+          ./logos/bin/logosctl --config-dir ./session call keystore_module configure '{"approvers":"evm_signer_ui","custodians":"manager_probe","managers":"signer_manager_module"}'
+          ./logos/bin/logosctl --config-dir ./session call signer_manager_module configure '{"approvers":"manager_probe","custodians":"manager_probe","signers":"keystore_module"}'
         code_block: |
-          logoscore call keystore_module configure '{"custodians":"manager_probe","managers":"signer_manager_module", …}'
-          logoscore call signer_manager_module configure '{"approvers":"manager_probe","custodians":"manager_probe","signers":"keystore_module"}'
+          logosctl call keystore_module configure '{"custodians":"manager_probe","managers":"signer_manager_module", …}'
+          logosctl call signer_manager_module configure '{"approvers":"manager_probe","custodians":"manager_probe","signers":"keystore_module"}'
         expect_contains:
           - '\"managers\":[\"signer_manager_module\"]'
           - '\"signers\":[\"keystore_module\"]'
       - title: "The manager reaches the keystore through the signer interface"
-        run: "./logos/bin/logoscore call signer_manager_module signers"
-        code_block: "logoscore call signer_manager_module signers"
+        run: "./logos/bin/logosctl --config-dir ./session call signer_manager_module signers"
+        code_block: "logosctl call signer_manager_module signers"
         expect_contains:
           - "logos.signer/1"
           - '\"kind\":\"keystore\"'
@@ -137,18 +135,18 @@ sections:
     steps:
       - title: "Import a key, as the keystore's custodian"
         run: |
-          ./logos/bin/logoscore call manager_probe import_key ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 pw
-          ./logos/bin/logoscore call signer_manager_module accounts
+          ./logos/bin/logosctl --config-dir ./session call manager_probe import_key ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 pw
+          ./logos/bin/logosctl --config-dir ./session call signer_manager_module accounts
         code_block: |
-          logoscore call manager_probe import_key <private key> pw
-          logoscore call signer_manager_module accounts
+          logosctl call manager_probe import_key <private key> pw
+          logosctl call signer_manager_module accounts
         expect_contains:
           - '\"signer\":\"keystore_module\"'
           - "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
       - title: "The CLI can't ask"
         text: "Asking is for named modules; the CLI is not one."
-        run: "./logos/bin/logoscore call signer_manager_module request_approval '{\"address\":\"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266\",\"legs\":[{\"kind\":\"message\",\"text\":\"hello-logos\"}]}'"
-        code_block: "logoscore call signer_manager_module request_approval '{...}'"
+        run: "./logos/bin/logosctl --config-dir ./session call signer_manager_module request_approval '{\"address\":\"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266\",\"legs\":[{\"kind\":\"message\",\"text\":\"hello-logos\"}]}'"
+        code_block: "logosctl call signer_manager_module request_approval '{...}'"
         expect_contains:
           - "not authorized"
       - title: "Ask, as a requester, and show it, as the approver"
@@ -156,14 +154,14 @@ sections:
           The approver gets the manager's own lines, the requester's claim apart from them, the
           commitment to echo back, the signer, and what that signer needs: a password.
         run: |
-          ./logos/bin/logoscore call manager_probe request '{"address":"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266","purpose":"doc-test","legs":[{"kind":"message","text":"hello-logos"}]}' > request.json
+          ./logos/bin/logosctl --config-dir ./session call manager_probe request '{"address":"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266","purpose":"doc-test","legs":[{"kind":"message","text":"hello-logos"}]}' > request.json
           python3 -c 'import json; r = json.loads(json.load(open("request.json"))["result"]); open("handle", "w").write(r["handle"]); open("receipt", "w").write(r["receipt"])'
-          ./logos/bin/logoscore call manager_probe acknowledge "$(cat handle)" > shown.json
+          ./logos/bin/logosctl --config-dir ./session call manager_probe acknowledge "$(cat handle)" > shown.json
           python3 -c 'import json; open("bundle", "w").write(json.loads(json.load(open("shown.json"))["result"])["bundle_id"])'
           cat shown.json
         code_block: |
-          logoscore call manager_probe request '{"address":"0xf39F…2266","purpose":"doc-test","legs":[{"kind":"message","text":"hello-logos"}]}'
-          logoscore call manager_probe acknowledge <handle>
+          logosctl call manager_probe request '{"address":"0xf39F…2266","purpose":"doc-test","legs":[{"kind":"message","text":"hello-logos"}]}'
+          logosctl call manager_probe acknowledge <handle>
         expect_contains:
           - "Sign text message"
           - "Text: hello-logos"
@@ -172,11 +170,11 @@ sections:
           - '\"signer\":\"keystore_module\"'
       - title: "A wrong password signs nothing and leaves the request on screen"
         run: |
-          ./logos/bin/logoscore call manager_probe approve "$(cat handle)" "$(cat bundle)" wrong
-          ./logos/bin/logoscore call manager_probe status "$(cat handle)" "$(cat receipt)"
+          ./logos/bin/logosctl --config-dir ./session call manager_probe approve "$(cat handle)" "$(cat bundle)" wrong
+          ./logos/bin/logosctl --config-dir ./session call manager_probe status "$(cat handle)" "$(cat receipt)"
         code_block: |
-          logoscore call manager_probe approve <handle> <bundle_id> wrong
-          logoscore call manager_probe status <handle> <receipt>
+          logosctl call manager_probe approve <handle> <bundle_id> wrong
+          logosctl call manager_probe status <handle> <receipt>
         expect_contains:
           - '\"code\":\"wrong_secret\"'
           - '\"state\":\"rendered\"'
@@ -186,11 +184,11 @@ sections:
           recovers to the account and returns it. It is byte for byte what the keystore returned
           when it signed messages itself.
         run: |
-          ./logos/bin/logoscore call manager_probe approve "$(cat handle)" "$(cat bundle)" pw
-          ./logos/bin/logoscore call manager_probe fetch "$(cat handle)" "$(cat receipt)"
+          ./logos/bin/logosctl --config-dir ./session call manager_probe approve "$(cat handle)" "$(cat bundle)" pw
+          ./logos/bin/logosctl --config-dir ./session call manager_probe fetch "$(cat handle)" "$(cat receipt)"
         code_block: |
-          logoscore call manager_probe approve <handle> <bundle_id> pw
-          logoscore call manager_probe fetch <handle> <receipt>
+          logosctl call manager_probe approve <handle> <bundle_id> pw
+          logosctl call manager_probe fetch <handle> <receipt>
         expect_contains:
           - '\"signed_count\":1'
           - "0x0eb9f28352f7922f2cbd640d4569c5dce34e261a78413a14f029f34e3fdb6685799fe51ca446a9998cba505370e0f4e11cb8ae05d0cdef67f44fb940f04c693b1c"
@@ -199,11 +197,11 @@ sections:
           The keystore's `sign` answers its manager alone, so neither the CLI nor another module can
           sign past the manager, even with the right password.
         run: |
-          ./logos/bin/logoscore call keystore_module sign '{"account":"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266","kind":"hash","items":[{"scheme":"evm","digest":"1111111111111111111111111111111111111111111111111111111111111111"}],"secret":"pw"}'
-          ./logos/bin/logoscore call manager_probe sign_direct '{"account":"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266","kind":"hash","items":[{"scheme":"evm","digest":"1111111111111111111111111111111111111111111111111111111111111111"}],"secret":"pw"}'
+          ./logos/bin/logosctl --config-dir ./session call keystore_module sign '{"account":"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266","kind":"hash","items":[{"scheme":"evm","digest":"1111111111111111111111111111111111111111111111111111111111111111"}],"secret":"pw"}'
+          ./logos/bin/logosctl --config-dir ./session call manager_probe sign_direct '{"account":"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266","kind":"hash","items":[{"scheme":"evm","digest":"1111111111111111111111111111111111111111111111111111111111111111"}],"secret":"pw"}'
         code_block: |
-          logoscore call keystore_module sign '{...}'          # refused: the CLI
-          logoscore call manager_probe sign_direct '{...}'    # refused: not the manager
+          logosctl call keystore_module sign '{...}'          # refused: the CLI
+          logosctl call manager_probe sign_direct '{...}'    # refused: not the manager
         expect_contains:
           - "not authorized"
 
@@ -218,34 +216,34 @@ sections:
     steps:
       - title: "Make a Bitcoin wallet, as the keystore's custodian"
         run: |
-          ./logos/bin/logoscore call manager_probe import_bitcoin '{"phrase":"test test test test test test test test test test test junk","family":"bitcoin","chain":"test","password":"pw","label":"Savings","origin":"restored","birthday":"2021-11-14"}' > wallet.json
+          ./logos/bin/logosctl --config-dir ./session call manager_probe import_bitcoin '{"phrase":"test test test test test test test test test test test junk","family":"bitcoin","chain":"test","password":"pw","label":"Savings","origin":"restored","birthday":"2021-11-14"}' > wallet.json
           python3 -c 'import json; open("group", "w").write(json.loads(json.load(open("wallet.json"))["result"])["group"])'
           cat wallet.json
-        code_block: "logoscore call manager_probe import_bitcoin '{\"phrase\":\"test … junk\",\"family\":\"bitcoin\",\"chain\":\"test\",\"password\":\"pw\",\"label\":\"Savings\",\"origin\":\"restored\",\"birthday\":\"2021-11-14\"}'"
+        code_block: "logosctl call manager_probe import_bitcoin '{\"phrase\":\"test … junk\",\"family\":\"bitcoin\",\"chain\":\"test\",\"password\":\"pw\",\"label\":\"Savings\",\"origin\":\"restored\",\"birthday\":\"2021-11-14\"}'"
         expect_contains:
           - "wpkh(["
       - title: "Ask to open one, and show it, as the keys app"
         run: |
-          ./logos/bin/logoscore call manager_probe open '{"family":"bitcoin","network":"regtest","reason":"doc-test"}' > open.json
+          ./logos/bin/logosctl --config-dir ./session call manager_probe open '{"family":"bitcoin","network":"regtest","reason":"doc-test"}' > open.json
           python3 -c 'import json; r = json.loads(json.load(open("open.json"))["result"]); open("ohandle", "w").write(r["handle"]); open("oreceipt", "w").write(r["receipt"])'
-          ./logos/bin/logoscore call manager_probe show "$(cat ohandle)" > oshown.json
+          ./logos/bin/logosctl --config-dir ./session call manager_probe show "$(cat ohandle)" > oshown.json
           python3 -c 'import json; open("obundle", "w").write(json.loads(json.load(open("oshown.json"))["result"])["bundle_id"])'
           cat oshown.json
         code_block: |
-          logoscore call manager_probe open '{"family":"bitcoin","network":"regtest","reason":"doc-test"}'
-          logoscore call manager_probe show <handle>
+          logosctl call manager_probe open '{"family":"bitcoin","network":"regtest","reason":"doc-test"}'
+          logosctl call manager_probe show <handle>
         expect_contains:
           - "manager_probe asks to open a Bitcoin wallet"
           - "Any native segwit wallet on regtest"
           - "It will see every address and transaction of that wallet"
       - title: "A wrong password opens nothing; the right one hands over the wallet"
         run: |
-          ./logos/bin/logoscore call manager_probe decide "{\"handle\":\"$(cat ohandle)\",\"bundle_id\":\"$(cat obundle)\",\"group\":\"$(cat group)\",\"password\":\"wrong\"}"
-          ./logos/bin/logoscore call manager_probe decide "{\"handle\":\"$(cat ohandle)\",\"bundle_id\":\"$(cat obundle)\",\"group\":\"$(cat group)\",\"password\":\"pw\"}"
-          ./logos/bin/logoscore call manager_probe fetch "$(cat ohandle)" "$(cat oreceipt)"
+          ./logos/bin/logosctl --config-dir ./session call manager_probe decide "{\"handle\":\"$(cat ohandle)\",\"bundle_id\":\"$(cat obundle)\",\"group\":\"$(cat group)\",\"password\":\"wrong\"}"
+          ./logos/bin/logosctl --config-dir ./session call manager_probe decide "{\"handle\":\"$(cat ohandle)\",\"bundle_id\":\"$(cat obundle)\",\"group\":\"$(cat group)\",\"password\":\"pw\"}"
+          ./logos/bin/logosctl --config-dir ./session call manager_probe fetch "$(cat ohandle)" "$(cat oreceipt)"
         code_block: |
-          logoscore call manager_probe decide '{"handle":"<handle>","bundle_id":"<bundle_id>","group":"<group>","password":"pw"}'
-          logoscore call manager_probe fetch <handle> <receipt>
+          logosctl call manager_probe decide '{"handle":"<handle>","bundle_id":"<bundle_id>","group":"<group>","password":"pw"}'
+          logosctl call manager_probe fetch <handle> <receipt>
         expect_contains:
           - '\"code\":\"wrong_secret\"'
           - "databaseKey"
@@ -254,15 +252,15 @@ sections:
           - "wpkh([16a93ed0/84'/1'/0']tpub"
       - title: "Its descriptors again, for this module only"
         run: |
-          ./logos/bin/logoscore call manager_probe descriptors "$(cat group)"
-          ./logos/bin/logoscore call signer_manager_module account_descriptors "$(cat group)"
-          ./logos/bin/logoscore call manager_probe close "$(cat group)"
-          ./logos/bin/logoscore call manager_probe descriptors "$(cat group)"
+          ./logos/bin/logosctl --config-dir ./session call manager_probe descriptors "$(cat group)"
+          ./logos/bin/logosctl --config-dir ./session call signer_manager_module account_descriptors "$(cat group)"
+          ./logos/bin/logosctl --config-dir ./session call manager_probe close "$(cat group)"
+          ./logos/bin/logosctl --config-dir ./session call manager_probe descriptors "$(cat group)"
         code_block: |
-          logoscore call manager_probe descriptors <group>                       # open for the probe
-          logoscore call signer_manager_module account_descriptors <group>       # refused: the CLI
-          logoscore call manager_probe close <group>
-          logoscore call manager_probe descriptors <group>                       # refused: closed
+          logosctl call manager_probe descriptors <group>                       # open for the probe
+          logosctl call signer_manager_module account_descriptors <group>       # refused: the CLI
+          logosctl call manager_probe close <group>
+          logosctl call manager_probe descriptors <group>                       # refused: closed
         expect_contains:
           - '\"external\":\"wpkh(['
           - '\"closed\":true'
@@ -279,17 +277,17 @@ sections:
       result.
     steps:
       - title: "Load the device"
-        run: "./logos/bin/logoscore load-module mock_device_signer"
-        code_block: "logoscore load-module mock_device_signer"
+        run: "./logos/bin/logosctl --config-dir ./session module load mock_device_signer"
+        code_block: "logosctl module load mock_device_signer"
         expect_contains:
           - "mock_device_signer"
       - title: "The manager consults it beside the keystore"
         run: |
-          ./logos/bin/logoscore call signer_manager_module configure '{"approvers":"manager_probe","custodians":"manager_probe","signers":["keystore_module","mock_device_signer"]}'
-          ./logos/bin/logoscore call signer_manager_module accounts
+          ./logos/bin/logosctl --config-dir ./session call signer_manager_module configure '{"approvers":"manager_probe","custodians":"manager_probe","signers":["keystore_module","mock_device_signer"]}'
+          ./logos/bin/logosctl --config-dir ./session call signer_manager_module accounts
         code_block: |
-          logoscore call signer_manager_module configure '{…, "signers":["keystore_module","mock_device_signer"]}'
-          logoscore call signer_manager_module accounts
+          logosctl call signer_manager_module configure '{…, "signers":["keystore_module","mock_device_signer"]}'
+          logosctl call signer_manager_module accounts
         expect_contains:
           - '\"signer\":\"mock_device_signer\"'
           - "0x9858effd232b4033e47d90003d41ec34ecaeda94"
@@ -298,19 +296,19 @@ sections:
           The device asks the person itself, so the approver sends no secret, and the request stays
           `signing` with the job on the device's screen.
         run: |
-          ./logos/bin/logoscore call manager_probe request '{"address":"0x9858EfFD232B4033E47d90003D41EC34EcaEda94","purpose":"doc-test on a device","legs":[{"kind":"message","text":"hello-device"}]}' > dreq.json
+          ./logos/bin/logosctl --config-dir ./session call manager_probe request '{"address":"0x9858EfFD232B4033E47d90003D41EC34EcaEda94","purpose":"doc-test on a device","legs":[{"kind":"message","text":"hello-device"}]}' > dreq.json
           python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' dreq.json handle > dhandle; python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' dreq.json receipt > dreceipt
-          ./logos/bin/logoscore call manager_probe acknowledge "$(cat dhandle)" > dshown.json
+          ./logos/bin/logosctl --config-dir ./session call manager_probe acknowledge "$(cat dhandle)" > dshown.json
           python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' dshown.json bundle_id > dbundle
           cat dshown.json
-          ./logos/bin/logoscore call manager_probe approve "$(cat dhandle)" "$(cat dbundle)" ""
-          ./logos/bin/logoscore call manager_probe status "$(cat dhandle)" "$(cat dreceipt)"
-          ./logos/bin/logoscore call mock_device_signer screen
+          ./logos/bin/logosctl --config-dir ./session call manager_probe approve "$(cat dhandle)" "$(cat dbundle)" ""
+          ./logos/bin/logosctl --config-dir ./session call manager_probe status "$(cat dhandle)" "$(cat dreceipt)"
+          ./logos/bin/logosctl --config-dir ./session call mock_device_signer screen
         code_block: |
-          logoscore call manager_probe request '{"address":"0x9858…aEda94","legs":[{"kind":"message","text":"hello-device"}]}'
-          logoscore call manager_probe acknowledge <handle>          # collects: nothing
-          logoscore call manager_probe approve <handle> <bundle_id> ""
-          logoscore call mock_device_signer screen                   # the job, waiting
+          logosctl call manager_probe request '{"address":"0x9858…aEda94","legs":[{"kind":"message","text":"hello-device"}]}'
+          logosctl call manager_probe acknowledge <handle>          # collects: nothing
+          logosctl call manager_probe approve <handle> <bundle_id> ""
+          logosctl call mock_device_signer screen                   # the job, waiting
         expect_contains:
           - '\"collects\":\"nothing\"'
           - '\"signer\":\"mock_device_signer\"'
@@ -321,33 +319,33 @@ sections:
           The manager listens to the device, so it announces `approval_settled` when the answer
           comes. A requester that only listens hears it without asking anyone.
         run: |
-          ./logos/bin/logoscore call mock_device_signer screen > screen.json
+          ./logos/bin/logosctl --config-dir ./session call mock_device_signer screen > screen.json
           python3 -c 'import json; print(json.loads(json.load(open("screen.json"))["result"])["waiting"][0]["job"])' > djob
-          ./logos/bin/logoscore call manager_probe heard > /dev/null
-          ./logos/bin/logoscore call mock_device_signer press "$(cat djob)" confirm
-          for i in $(seq 1 20); do ./logos/bin/logoscore call manager_probe heard > heard.json; grep -q "$(cat dhandle)" heard.json && break; sleep 0.5; done
+          ./logos/bin/logosctl --config-dir ./session call manager_probe heard > /dev/null
+          ./logos/bin/logosctl --config-dir ./session call mock_device_signer press "$(cat djob)" confirm
+          for i in $(seq 1 20); do ./logos/bin/logosctl --config-dir ./session call manager_probe heard > heard.json; grep -q "$(cat dhandle)" heard.json && break; sleep 0.5; done
           cat heard.json
-          ./logos/bin/logoscore call manager_probe status "$(cat dhandle)" "$(cat dreceipt)"
-          ./logos/bin/logoscore call manager_probe fetch "$(cat dhandle)" "$(cat dreceipt)"
+          ./logos/bin/logosctl --config-dir ./session call manager_probe status "$(cat dhandle)" "$(cat dreceipt)"
+          ./logos/bin/logosctl --config-dir ./session call manager_probe fetch "$(cat dhandle)" "$(cat dreceipt)"
         code_block: |
-          logoscore call mock_device_signer press <job> confirm
-          logoscore call manager_probe heard                         # approval_settled, unasked
-          logoscore call manager_probe status <handle> <receipt>
-          logoscore call manager_probe fetch <handle> <receipt>
+          logosctl call mock_device_signer press <job> confirm
+          logosctl call manager_probe heard                         # approval_settled, unasked
+          logosctl call manager_probe status <handle> <receipt>
+          logosctl call manager_probe fetch <handle> <receipt>
         expect_contains:
           - '\"event\":\"approval_settled\"'
           - '\"reason\":\"approved\"'
           - '\"signed\":[\"0x'
       - title: "A refusal on the device ends the request"
         run: |
-          ./logos/bin/logoscore call manager_probe request '{"address":"0x9858EfFD232B4033E47d90003D41EC34EcaEda94","purpose":"doc-test on a device","legs":[{"kind":"message","text":"declined"}]}' > rreq.json
+          ./logos/bin/logosctl --config-dir ./session call manager_probe request '{"address":"0x9858EfFD232B4033E47d90003D41EC34EcaEda94","purpose":"doc-test on a device","legs":[{"kind":"message","text":"declined"}]}' > rreq.json
           python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' rreq.json handle > rhandle; python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' rreq.json receipt > rreceipt
-          ./logos/bin/logoscore call manager_probe acknowledge "$(cat rhandle)" > rshown.json
-          ./logos/bin/logoscore call manager_probe approve "$(cat rhandle)" "$(python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' rshown.json bundle_id)" ""
-          ./logos/bin/logoscore call mock_device_signer screen > screen.json
-          ./logos/bin/logoscore call mock_device_signer press "$(python3 -c 'import json; print(json.loads(json.load(open("screen.json"))["result"])["waiting"][0]["job"])')" refuse
-          ./logos/bin/logoscore call manager_probe status "$(cat rhandle)" "$(cat rreceipt)"
-        code_block: "logoscore call mock_device_signer press <job> refuse"
+          ./logos/bin/logosctl --config-dir ./session call manager_probe acknowledge "$(cat rhandle)" > rshown.json
+          ./logos/bin/logosctl --config-dir ./session call manager_probe approve "$(cat rhandle)" "$(python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' rshown.json bundle_id)" ""
+          ./logos/bin/logosctl --config-dir ./session call mock_device_signer screen > screen.json
+          ./logos/bin/logosctl --config-dir ./session call mock_device_signer press "$(python3 -c 'import json; print(json.loads(json.load(open("screen.json"))["result"])["waiting"][0]["job"])')" refuse
+          ./logos/bin/logosctl --config-dir ./session call manager_probe status "$(cat rhandle)" "$(cat rreceipt)"
+        code_block: "logosctl call mock_device_signer press <job> refuse"
         expect_contains:
           - '\"reason\":\"rejected\"'
       - title: "A doctored answer is refused, and the request stays on screen"
@@ -356,22 +354,22 @@ sections:
           checks it against the account before building anything. It refuses it, puts the request
           back on screen saying why, and the requester gets nothing.
         run: |
-          ./logos/bin/logoscore call mock_device_signer doctor other_key
-          ./logos/bin/logoscore call manager_probe request '{"address":"0x9858EfFD232B4033E47d90003D41EC34EcaEda94","purpose":"doc-test on a device","legs":[{"kind":"message","text":"doctored"}]}' > xreq.json
+          ./logos/bin/logosctl --config-dir ./session call mock_device_signer doctor other_key
+          ./logos/bin/logosctl --config-dir ./session call manager_probe request '{"address":"0x9858EfFD232B4033E47d90003D41EC34EcaEda94","purpose":"doc-test on a device","legs":[{"kind":"message","text":"doctored"}]}' > xreq.json
           python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' xreq.json handle > xhandle; python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' xreq.json receipt > xreceipt
-          ./logos/bin/logoscore call manager_probe acknowledge "$(cat xhandle)" > xshown.json
-          ./logos/bin/logoscore call manager_probe approve "$(cat xhandle)" "$(python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' xshown.json bundle_id)" ""
-          ./logos/bin/logoscore call mock_device_signer screen > screen.json
-          ./logos/bin/logoscore call mock_device_signer press "$(python3 -c 'import json; print(json.loads(json.load(open("screen.json"))["result"])["waiting"][0]["job"])')" confirm
-          ./logos/bin/logoscore call manager_probe status "$(cat xhandle)" "$(cat xreceipt)"
-          ./logos/bin/logoscore call manager_probe pending
-          ./logos/bin/logoscore call manager_probe reject "$(cat xhandle)"
-          ./logos/bin/logoscore call mock_device_signer doctor none
+          ./logos/bin/logosctl --config-dir ./session call manager_probe acknowledge "$(cat xhandle)" > xshown.json
+          ./logos/bin/logosctl --config-dir ./session call manager_probe approve "$(cat xhandle)" "$(python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' xshown.json bundle_id)" ""
+          ./logos/bin/logosctl --config-dir ./session call mock_device_signer screen > screen.json
+          ./logos/bin/logosctl --config-dir ./session call mock_device_signer press "$(python3 -c 'import json; print(json.loads(json.load(open("screen.json"))["result"])["waiting"][0]["job"])')" confirm
+          ./logos/bin/logosctl --config-dir ./session call manager_probe status "$(cat xhandle)" "$(cat xreceipt)"
+          ./logos/bin/logosctl --config-dir ./session call manager_probe pending
+          ./logos/bin/logosctl --config-dir ./session call manager_probe reject "$(cat xhandle)"
+          ./logos/bin/logosctl --config-dir ./session call mock_device_signer doctor none
         code_block: |
-          logoscore call mock_device_signer doctor other_key
-          logoscore call mock_device_signer press <job> confirm
-          logoscore call manager_probe status <handle> <receipt>     # rendered again
-          logoscore call manager_probe pending                       # with the reason
+          logosctl call mock_device_signer doctor other_key
+          logosctl call mock_device_signer press <job> confirm
+          logosctl call manager_probe status <handle> <receipt>     # rendered again
+          logosctl call manager_probe pending                       # with the reason
         expect_contains:
           - '\"state\":\"rendered\"'
           - "recovers to"
@@ -381,16 +379,16 @@ sections:
           announces `accounts_changed` as soon as the device reports it, so an app that only
           listens, such as the keys app, shows it at once.
         run: |
-          ./logos/bin/logoscore call manager_probe heard > /dev/null
-          ./logos/bin/logoscore call mock_device_signer plug false
-          for i in $(seq 1 20); do ./logos/bin/logoscore call manager_probe heard > heard.json; grep -q accounts_changed heard.json && break; sleep 0.5; done
+          ./logos/bin/logosctl --config-dir ./session call manager_probe heard > /dev/null
+          ./logos/bin/logosctl --config-dir ./session call mock_device_signer plug false
+          for i in $(seq 1 20); do ./logos/bin/logosctl --config-dir ./session call manager_probe heard > heard.json; grep -q accounts_changed heard.json && break; sleep 0.5; done
           cat heard.json
-          ./logos/bin/logoscore call signer_manager_module accounts
-          ./logos/bin/logoscore call mock_device_signer plug true
+          ./logos/bin/logosctl --config-dir ./session call signer_manager_module accounts
+          ./logos/bin/logosctl --config-dir ./session call mock_device_signer plug true
         code_block: |
-          logoscore call mock_device_signer plug false
-          logoscore call manager_probe heard                         # accounts_changed, unasked
-          logoscore call signer_manager_module accounts              # the device's: "available":false
+          logosctl call mock_device_signer plug false
+          logosctl call manager_probe heard                         # accounts_changed, unasked
+          logosctl call signer_manager_module accounts              # the device's: "available":false
         expect_contains:
           - '\"event\":\"accounts_changed\"'
           - '\"available\":false'
@@ -401,25 +399,25 @@ sections:
           read, and checks the answer over its own digest, as for any signer. Here the mock device
           becomes such a device and is handed a message.
         run: |
-          ./logos/bin/logoscore call manager_probe heard > /dev/null
-          ./logos/bin/logoscore call mock_device_signer whole true
-          for i in $(seq 1 20); do ./logos/bin/logoscore call manager_probe heard | grep -q accounts_changed && break; sleep 0.5; done
-          ./logos/bin/logoscore call manager_probe request '{"address":"0x9858EfFD232B4033E47d90003D41EC34EcaEda94","purpose":"doc-test on a device","legs":[{"kind":"message","text":"shown on the device"}]}' > wreq.json
+          ./logos/bin/logosctl --config-dir ./session call manager_probe heard > /dev/null
+          ./logos/bin/logosctl --config-dir ./session call mock_device_signer whole true
+          for i in $(seq 1 20); do ./logos/bin/logosctl --config-dir ./session call manager_probe heard | grep -q accounts_changed && break; sleep 0.5; done
+          ./logos/bin/logosctl --config-dir ./session call manager_probe request '{"address":"0x9858EfFD232B4033E47d90003D41EC34EcaEda94","purpose":"doc-test on a device","legs":[{"kind":"message","text":"shown on the device"}]}' > wreq.json
           python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' wreq.json handle > whandle; python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' wreq.json receipt > wreceipt
-          ./logos/bin/logoscore call manager_probe acknowledge "$(cat whandle)" > wshown.json
-          ./logos/bin/logoscore call manager_probe approve "$(cat whandle)" "$(python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' wshown.json bundle_id)" ""
-          ./logos/bin/logoscore call mock_device_signer screen > wscreen.json
+          ./logos/bin/logosctl --config-dir ./session call manager_probe acknowledge "$(cat whandle)" > wshown.json
+          ./logos/bin/logosctl --config-dir ./session call manager_probe approve "$(cat whandle)" "$(python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' wshown.json bundle_id)" ""
+          ./logos/bin/logosctl --config-dir ./session call mock_device_signer screen > wscreen.json
           cat wscreen.json
-          ./logos/bin/logoscore call mock_device_signer press "$(python3 -c 'import json; print(json.loads(json.load(open("wscreen.json"))["result"])["waiting"][0]["job"])')" confirm
-          ./logos/bin/logoscore call manager_probe status "$(cat whandle)" "$(cat wreceipt)"
-          ./logos/bin/logoscore call manager_probe fetch "$(cat whandle)" "$(cat wreceipt)"
-          ./logos/bin/logoscore call mock_device_signer whole false
+          ./logos/bin/logosctl --config-dir ./session call mock_device_signer press "$(python3 -c 'import json; print(json.loads(json.load(open("wscreen.json"))["result"])["waiting"][0]["job"])')" confirm
+          ./logos/bin/logosctl --config-dir ./session call manager_probe status "$(cat whandle)" "$(cat wreceipt)"
+          ./logos/bin/logosctl --config-dir ./session call manager_probe fetch "$(cat whandle)" "$(cat wreceipt)"
+          ./logos/bin/logosctl --config-dir ./session call mock_device_signer whole false
         code_block: |
-          logoscore call mock_device_signer whole true
-          logoscore call manager_probe request '{"address":"0x9858…aEda94","legs":[{"kind":"message","text":"shown on the device"}]}'
-          logoscore call mock_device_signer screen                   # "kind":"evm_message"
-          logoscore call mock_device_signer press <job> confirm
-          logoscore call manager_probe fetch <handle> <receipt>
+          logosctl call mock_device_signer whole true
+          logosctl call manager_probe request '{"address":"0x9858…aEda94","legs":[{"kind":"message","text":"shown on the device"}]}'
+          logosctl call mock_device_signer screen                   # "kind":"evm_message"
+          logosctl call mock_device_signer press <job> confirm
+          logosctl call manager_probe fetch <handle> <receipt>
         expect_contains:
           - '\"kind\":\"evm_message\"'
           - '\"reason\":\"approved\"'
@@ -432,33 +430,33 @@ sections:
           sets then. A device keeps no record of when its seed was made, so the wallet is `restored`,
           with the first day of use the person gives.
         run: |
-          ./logos/bin/logoscore call manager_probe open '{"group":"mock-segwit","network":"regtest"}' > dopen.json
+          ./logos/bin/logosctl --config-dir ./session call manager_probe open '{"group":"mock-segwit","network":"regtest"}' > dopen.json
           python3 -c 'import json; r = json.loads(json.load(open("dopen.json"))["result"]); open("dhandle", "w").write(r["handle"]); open("dreceipt", "w").write(r["receipt"])'
-          ./logos/bin/logoscore call manager_probe show "$(cat dhandle)" > dshown.json
+          ./logos/bin/logosctl --config-dir ./session call manager_probe show "$(cat dhandle)" > dshown.json
           python3 -c 'import json; open("dbundle", "w").write(json.loads(json.load(open("dshown.json"))["result"])["bundle_id"])'
-          ./logos/bin/logoscore call manager_probe decide "{\"handle\":\"$(cat dhandle)\",\"bundle_id\":\"$(cat dbundle)\",\"password\":\"data-pw\",\"birthday\":\"2021-11-14\"}"
-          ./logos/bin/logoscore call manager_probe fetch "$(cat dhandle)" "$(cat dreceipt)" | tee dfetch.json
+          ./logos/bin/logosctl --config-dir ./session call manager_probe decide "{\"handle\":\"$(cat dhandle)\",\"bundle_id\":\"$(cat dbundle)\",\"password\":\"data-pw\",\"birthday\":\"2021-11-14\"}"
+          ./logos/bin/logosctl --config-dir ./session call manager_probe fetch "$(cat dhandle)" "$(cat dreceipt)" | tee dfetch.json
         code_block: |
-          logoscore call manager_probe open '{"group":"mock-segwit","network":"regtest"}'
-          logoscore call manager_probe decide '{"handle":"<handle>","bundle_id":"<bundle_id>","password":"data-pw","birthday":"2021-11-14"}'
-          logoscore call manager_probe fetch <handle> <receipt>
+          logosctl call manager_probe open '{"group":"mock-segwit","network":"regtest"}'
+          logosctl call manager_probe decide '{"handle":"<handle>","bundle_id":"<bundle_id>","password":"data-pw","birthday":"2021-11-14"}'
+          logosctl call manager_probe fetch <handle> <receipt>
         expect_contains:
           - '\"origin\":\"restored\"'
           - '\"birthday\":\"2021-11-14\"'
           - "databaseKey"
       - title: "Opened again, it takes that password and hands over the same key"
         run: |
-          ./logos/bin/logoscore call manager_probe open '{"group":"mock-segwit","network":"regtest"}' > dopen2.json
+          ./logos/bin/logosctl --config-dir ./session call manager_probe open '{"group":"mock-segwit","network":"regtest"}' > dopen2.json
           python3 -c 'import json; r = json.loads(json.load(open("dopen2.json"))["result"]); open("dhandle2", "w").write(r["handle"]); open("dreceipt2", "w").write(r["receipt"])'
-          ./logos/bin/logoscore call manager_probe show "$(cat dhandle2)" > dshown2.json
+          ./logos/bin/logosctl --config-dir ./session call manager_probe show "$(cat dhandle2)" > dshown2.json
           python3 -c 'import json; open("dbundle2", "w").write(json.loads(json.load(open("dshown2.json"))["result"])["bundle_id"])'
-          ./logos/bin/logoscore call manager_probe decide "{\"handle\":\"$(cat dhandle2)\",\"bundle_id\":\"$(cat dbundle2)\",\"password\":\"wrong\"}"
-          ./logos/bin/logoscore call manager_probe decide "{\"handle\":\"$(cat dhandle2)\",\"bundle_id\":\"$(cat dbundle2)\",\"password\":\"data-pw\"}"
-          ./logos/bin/logoscore call manager_probe fetch "$(cat dhandle2)" "$(cat dreceipt2)" > dfetch2.json
+          ./logos/bin/logosctl --config-dir ./session call manager_probe decide "{\"handle\":\"$(cat dhandle2)\",\"bundle_id\":\"$(cat dbundle2)\",\"password\":\"wrong\"}"
+          ./logos/bin/logosctl --config-dir ./session call manager_probe decide "{\"handle\":\"$(cat dhandle2)\",\"bundle_id\":\"$(cat dbundle2)\",\"password\":\"data-pw\"}"
+          ./logos/bin/logosctl --config-dir ./session call manager_probe fetch "$(cat dhandle2)" "$(cat dreceipt2)" > dfetch2.json
           python3 -c 'import json; k = lambda f: json.loads(json.load(open(f))["result"])["result"]["databaseKey"]; print("the same database key" if k("dfetch.json") == k("dfetch2.json") else "a different key")'
         code_block: |
-          logoscore call manager_probe decide '{"handle":"<handle>","bundle_id":"<bundle_id>","password":"wrong"}'     # wrong_secret
-          logoscore call manager_probe decide '{"handle":"<handle>","bundle_id":"<bundle_id>","password":"data-pw"}'
+          logosctl call manager_probe decide '{"handle":"<handle>","bundle_id":"<bundle_id>","password":"wrong"}'     # wrong_secret
+          logosctl call manager_probe decide '{"handle":"<handle>","bundle_id":"<bundle_id>","password":"data-pw"}'
         expect_contains:
           - '\"code\":\"wrong_secret\"'
           - "the same database key"
@@ -473,63 +471,63 @@ sections:
     steps:
       - title: "The keystore holds the device's account too"
         run: |
-          ./logos/bin/logoscore call manager_probe import_phrase '{"phrase":"abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about","accountIndex":0,"password":"pw"}'
+          ./logos/bin/logosctl --config-dir ./session call manager_probe import_phrase '{"phrase":"abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about","accountIndex":0,"password":"pw"}'
           for i in $(seq 1 20); do
-            ./logos/bin/logoscore call manager_probe roster > roster.json
+            ./logos/bin/logosctl --config-dir ./session call manager_probe roster > roster.json
             python3 -c 'import json,sys; r = json.loads(json.load(open("roster.json"))["result"]); e = [a for a in r["accounts"] if a["key"] == sys.argv[1]]; print("holders:", [(h["signer"], h["transport"], h["presence"]) for h in e[0]["holders"]] if e else [])' 0x9858effd232b4033e47d90003d41ec34ecaeda94 > holders.txt
             grep -q keystore_module holders.txt && break; sleep 0.5
           done
           cat holders.txt
         code_block: |
-          logoscore call manager_probe import_phrase '{"phrase":"abandon … about","accountIndex":0,"password":"pw"}'
-          logoscore call manager_probe roster              # one entry, both holders, ranked
+          logosctl call manager_probe import_phrase '{"phrase":"abandon … about","accountIndex":0,"password":"pw"}'
+          logosctl call manager_probe roster              # one entry, both holders, ranked
         expect_contains:
           - "holders: [('keystore_module', 'keystore', 'local'), ('mock_device_signer', 'other', 'connected')]"
       - title: "The approver is offered both, and chooses the device"
         run: |
-          ./logos/bin/logoscore call manager_probe request '{"address":"0x9858EfFD232B4033E47d90003D41EC34EcaEda94","purpose":"doc-test, two signers","legs":[{"kind":"message","text":"two signers"}]}' > mreq.json
+          ./logos/bin/logosctl --config-dir ./session call manager_probe request '{"address":"0x9858EfFD232B4033E47d90003D41EC34EcaEda94","purpose":"doc-test, two signers","legs":[{"kind":"message","text":"two signers"}]}' > mreq.json
           python3 -c 'import json; r = json.loads(json.load(open("mreq.json"))["result"]); open("mhandle", "w").write(r["handle"]); open("mreceipt", "w").write(r["receipt"])'
-          ./logos/bin/logoscore call manager_probe acknowledge "$(cat mhandle)" > mshown.json
+          ./logos/bin/logosctl --config-dir ./session call manager_probe acknowledge "$(cat mhandle)" > mshown.json
           python3 -c 'import json; r = json.loads(json.load(open("mshown.json"))["result"]); open("mbundle", "w").write(r["bundle_id"]); print("default:", r["signer"], "explicit:", r["explicit"], "offered:", [c["signer"] for c in r["signers"]])'
-          ./logos/bin/logoscore call manager_probe choose "$(cat mhandle)" "$(cat mbundle)" mock_device_signer > mchosen.json
+          ./logos/bin/logosctl --config-dir ./session call manager_probe choose "$(cat mhandle)" "$(cat mbundle)" mock_device_signer > mchosen.json
           python3 -c 'import json; r = json.loads(json.load(open("mchosen.json"))["result"]); print("chosen:", r["signer"], "explicit:", r["explicit"], "collects:", r["collects"], "same commitment:", r["bundle_id"] == open("mbundle").read())'
         code_block: |
-          logoscore call manager_probe acknowledge <handle>                           # signer: keystore_module, signers: [keystore, device]
-          logoscore call manager_probe choose <handle> <bundle_id> mock_device_signer  # the same bundle_id
+          logosctl call manager_probe acknowledge <handle>                           # signer: keystore_module, signers: [keystore, device]
+          logosctl call manager_probe choose <handle> <bundle_id> mock_device_signer  # the same bundle_id
         expect_contains:
           - "default: keystore_module explicit: False offered: ['keystore_module', 'mock_device_signer']"
           - "chosen: mock_device_signer explicit: True collects: nothing same commitment: True"
       - title: "Unplugged, the choice says so, and the request stays on screen"
         run: |
-          ./logos/bin/logoscore call manager_probe heard > /dev/null
-          ./logos/bin/logoscore call mock_device_signer plug false
-          for i in $(seq 1 20); do ./logos/bin/logoscore call manager_probe heard | grep -q accounts_changed && break; sleep 0.5; done
-          ./logos/bin/logoscore call manager_probe approve "$(cat mhandle)" "$(cat mbundle)" ""
-          ./logos/bin/logoscore call manager_probe status "$(cat mhandle)" "$(cat mreceipt)"
+          ./logos/bin/logosctl --config-dir ./session call manager_probe heard > /dev/null
+          ./logos/bin/logosctl --config-dir ./session call mock_device_signer plug false
+          for i in $(seq 1 20); do ./logos/bin/logosctl --config-dir ./session call manager_probe heard | grep -q accounts_changed && break; sleep 0.5; done
+          ./logos/bin/logosctl --config-dir ./session call manager_probe approve "$(cat mhandle)" "$(cat mbundle)" ""
+          ./logos/bin/logosctl --config-dir ./session call manager_probe status "$(cat mhandle)" "$(cat mreceipt)"
         code_block: |
-          logoscore call mock_device_signer plug false
-          logoscore call manager_probe approve <handle> <bundle_id> ""    # unavailable
-          logoscore call manager_probe status <handle> <receipt>          # rendered
+          logosctl call mock_device_signer plug false
+          logosctl call manager_probe approve <handle> <bundle_id> ""    # unavailable
+          logosctl call manager_probe status <handle> <receipt>          # rendered
         expect_contains:
           - '\"code\":\"unavailable\"'
           - "connect it or choose another signer"
           - '\"state\":\"rendered\"'
       - title: "Plugged back in, the device signs it"
         run: |
-          ./logos/bin/logoscore call manager_probe heard > /dev/null
-          ./logos/bin/logoscore call mock_device_signer plug true
-          for i in $(seq 1 20); do ./logos/bin/logoscore call manager_probe heard | grep -q accounts_changed && break; sleep 0.5; done
-          ./logos/bin/logoscore call manager_probe approve "$(cat mhandle)" "$(cat mbundle)" ""
-          ./logos/bin/logoscore call mock_device_signer screen > mscreen.json
-          ./logos/bin/logoscore call mock_device_signer press "$(python3 -c 'import json; print(json.loads(json.load(open("mscreen.json"))["result"])["waiting"][0]["job"])')" confirm
-          for i in $(seq 1 20); do ./logos/bin/logoscore call manager_probe status "$(cat mhandle)" "$(cat mreceipt)" > mstatus.json; grep -q settled mstatus.json && break; sleep 0.5; done
+          ./logos/bin/logosctl --config-dir ./session call manager_probe heard > /dev/null
+          ./logos/bin/logosctl --config-dir ./session call mock_device_signer plug true
+          for i in $(seq 1 20); do ./logos/bin/logosctl --config-dir ./session call manager_probe heard | grep -q accounts_changed && break; sleep 0.5; done
+          ./logos/bin/logosctl --config-dir ./session call manager_probe approve "$(cat mhandle)" "$(cat mbundle)" ""
+          ./logos/bin/logosctl --config-dir ./session call mock_device_signer screen > mscreen.json
+          ./logos/bin/logosctl --config-dir ./session call mock_device_signer press "$(python3 -c 'import json; print(json.loads(json.load(open("mscreen.json"))["result"])["waiting"][0]["job"])')" confirm
+          for i in $(seq 1 20); do ./logos/bin/logosctl --config-dir ./session call manager_probe status "$(cat mhandle)" "$(cat mreceipt)" > mstatus.json; grep -q settled mstatus.json && break; sleep 0.5; done
           cat mstatus.json
-          ./logos/bin/logoscore call manager_probe fetch "$(cat mhandle)" "$(cat mreceipt)"
+          ./logos/bin/logosctl --config-dir ./session call manager_probe fetch "$(cat mhandle)" "$(cat mreceipt)"
         code_block: |
-          logoscore call mock_device_signer plug true
-          logoscore call manager_probe approve <handle> <bundle_id> ""    # signing, on the device
-          logoscore call mock_device_signer press <job> confirm
-          logoscore call manager_probe fetch <handle> <receipt>
+          logosctl call mock_device_signer plug true
+          logosctl call manager_probe approve <handle> <bundle_id> ""    # signing, on the device
+          logosctl call mock_device_signer press <job> confirm
+          logosctl call manager_probe fetch <handle> <receipt>
         expect_contains:
           - '\"state\":\"signing\"'
           - '\"reason\":\"approved\"'
@@ -538,11 +536,11 @@ sections:
     step: true
     steps:
       - title: "Stop the daemon"
-        run: "./logos/bin/logoscore stop"
-        code_block: "logoscore stop"
+        run: "./logos/bin/logosctl --config-dir ./session daemon stop"
+        code_block: "logosctl daemon stop"
       - run: "sleep 2"
       - title: "Confirm the daemon has stopped"
-        run: "./logos/bin/logoscore status || true"
-        code_block: "logoscore status"
+        run: "./logos/bin/logosctl --config-dir ./session daemon status || true"
+        code_block: "logosctl daemon status"
         expect_contains:
           - '"status":"not_running"'
