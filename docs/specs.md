@@ -299,7 +299,7 @@ held the lock, and the manager hung.
 cd rust-lib && cargo test --no-default-features   # the core, against the interface's mock signer
 nix build                                         # the module
 nix build '.#lgx'                                 # an installable package
-./doctests/run.sh                                 # the round trip through logoscore
+./doctests/run.sh                                 # the round trip through logosctl
 ```
 
 `tools/regtest` proves the PSBT path against a real node. BDK builds native segwit and taproot sends
