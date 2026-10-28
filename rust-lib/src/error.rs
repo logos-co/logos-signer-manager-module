@@ -19,6 +19,9 @@ pub enum ManagerError {
     /// The signer a request would use changed after the person saw it: they review it again.
     #[error("{0}")]
     SignerChanged(String),
+    /// A holder brought the key of another wallet than its own: this names that wallet.
+    #[error("this seed is already the wallet {0}")]
+    Taken(String),
 }
 
 impl ManagerError {
@@ -34,6 +37,7 @@ impl ManagerError {
     pub fn wire_code(&self) -> Option<String> {
         match self {
             ManagerError::SignerChanged(_) => Some("signer_changed".into()),
+            ManagerError::Taken(_) => Some("invalid".into()),
             _ => self.code().and_then(|c| serde_json::to_value(c).ok()?.as_str().map(str::to_string)),
         }
     }

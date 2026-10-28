@@ -121,9 +121,9 @@ refuse or stall a request, but it can't get a false signature past the checks ab
 | `lock` | `params_json` | `{ ok, locked }` |
 | `unlocked` | — | `{ ok, unlocked: [{ account, expiresInMs, countLeft, apps, confirm }] }` |
 | `unattended_signatures` | — | `{ ok, signed: [{ handle, requester, account, ageMs }] }` |
-| `wallets` | — | `{ ok, wallets: [{ seed, name, locked, kinds, privateName? }] }` |
+| `wallets` | — | `{ ok, wallets: [{ seed, name, locked, kinds, privateName?, holderSeed?, device?, wayIn? }] }`; the last three only to a holder of that wallet |
 | `data_key` | `params_json` | `{ ok, key, generation, seed }`, or `{ ok: false, code: "locked" }` |
-| `enroll_seed` | `params_json` | `{ ok, seed, new, unlocked }` |
+| `enroll_seed` | `params_json` | `{ ok, seed, new, unlocked, device, wayIn }`, or `{ ok: false, code: "invalid", error, wallet }` |
 | `wallet_settings` | — | `{ ok, wallets: [{ seed, name, privateName?, locked, holders, device, index, generation, ways, origin?, birthday? }], passwords: [{ id, name, wallets }] }`; `device`: its holders give an unlock key |
 | `unlock_wallet`, `set_rule`, `change_keys` | `params_json` | `{ ok, state: "done" }`, or `{ ok, state: "device", handle }`, or `{ ok: false, code, error }` |
 | `unlock_progress` | `handle` | `{ ok, state, seed, step?, code?, error? }` |
@@ -258,6 +258,10 @@ restart or a `lock_wallets`.
   birthday? }`, where `seed` is the signer's own name for the seed (a Keycard's key UID, a Shell's
   master key id, a QR wallet's master fingerprint, a keystore wallet's id). A new wallet is
   unlocked at once. A seed already known, by that holder or by its unlock key, gains the holder.
+  A known seed with no unlock key yet, open and with no way in, takes "device only" when its
+  holder brings the key; a rule it already has stays. A holder whose key is another wallet's is
+  refused with `code: "invalid"` and that wallet's name in `wallet`, and nothing changes.
+  `device` says its unlock key is known, `wayIn` that it can be unlocked after a lock.
   Signers list a wallet's accounts, xpubs included, only while it is unlocked.
 - **Unlocking.** The Signer app calls `unlock_wallet({ seed, way, holder?, secret?, passwords? })`.
   A way without the device settles at once. One with it asks the holder for the unlock key: a PIN
