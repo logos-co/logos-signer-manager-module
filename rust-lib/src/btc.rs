@@ -253,7 +253,8 @@ pub fn descriptor_checksum(desc: &str) -> Option<String> {
 
 impl AccountPublic {
     /// A signer's Bitcoin account, read from its listing; refused unless every field agrees.
-    pub fn from_account(a: &logos_signer_interface::Account) -> Result<Self> {
+    /// Its family and chain, which an account lists without its xpub.
+    pub fn kind_of(a: &logos_signer_interface::Account) -> Result<(Family, Chain)> {
         use logos_signer_interface::{Chain as WireChain, Family as WireFamily};
         let family = match a.family {
             WireFamily::Bitcoin => Family::Segwit,
@@ -265,6 +266,11 @@ impl AccountPublic {
             Some(WireChain::Test) => Chain::Test,
             None => return Err(bad(format!("{} names no chain", a.id))),
         };
+        Ok((family, chain))
+    }
+
+    pub fn from_account(a: &logos_signer_interface::Account) -> Result<Self> {
+        let (family, chain) = Self::kind_of(a)?;
         let path = a.path.as_deref().ok_or_else(|| bad(format!("{} names no path", a.id)))?;
         let account = parse_account_path(path, family, chain)?;
         let fingerprint = a
@@ -394,6 +400,8 @@ pub(crate) mod tests {
             xpub: Some(BIP86_XPUB.into()),
             label: None,
             available: true,
+            key: None,
+            seed: None,
         };
         assert_eq!(AccountPublic::from_account(&listed).unwrap(), public);
         for broken in [

@@ -428,6 +428,8 @@ pub(crate) mod tests {
             xpub: Some(key.public_key().to_string(Prefix::TPUB)),
             label: None,
             available: true,
+            key: None,
+            seed: None,
         };
         AccountPublic::from_account(&listed).unwrap()
     }
@@ -606,7 +608,7 @@ pub(crate) mod tests {
         let c = checked(acct, psbt)?;
         let items = hash_items(acct, psbt, &c)?;
         let job = signer
-            .sign(SignRequest { account: listed.id.clone(), payload: Payload::Hash { items: items.clone() }, secret: None })
+            .sign(SignRequest { account: listed.id.clone(), payload: Payload::Hash { items: items.clone() }, secret: None, xpub: None })
             .unwrap();
         let sigs = signer.result(&job).unwrap();
         insert_signatures(&Secp256k1::new(), acct, psbt, &c, &items, &sigs)
@@ -654,7 +656,7 @@ pub(crate) mod tests {
             let items = hash_items(&acct, &psbt, &c).unwrap();
             // Signatures for the inputs swapped: each verifies, but over the other input's sighash.
             let job = signer
-                .sign(SignRequest { account: listed.id.clone(), payload: Payload::Hash { items: items.clone() }, secret: None })
+                .sign(SignRequest { account: listed.id.clone(), payload: Payload::Hash { items: items.clone() }, secret: None, xpub: None })
                 .unwrap();
             let mut sigs = signer.result(&job).unwrap();
             sigs[0].item = 1;
