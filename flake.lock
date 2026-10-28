@@ -5876,17 +5876,17 @@
     "logos-signer-interface": {
       "flake": false,
       "locked": {
-        "lastModified": 1792693772,
-        "narHash": "sha256-qaeEDsVeaqo2uL+Yux0ZTyZP9KInc92ECNhx2RVhjfM=",
+        "lastModified": 1793218879,
+        "narHash": "sha256-50tfoMe7w+9CmZcUSL9nGjv1R8eQtXWmnomSLkOWgYk=",
         "owner": "logos-co",
         "repo": "logos-signer-interface",
-        "rev": "752b7bd69a79ead110efccab40a64731535187f5",
+        "rev": "d8cfff84327c9b2b5cdb9702d1c4217cad567cee",
         "type": "github"
       },
       "original": {
         "owner": "logos-co",
         "repo": "logos-signer-interface",
-        "rev": "752b7bd69a79ead110efccab40a64731535187f5",
+        "rev": "d8cfff84327c9b2b5cdb9702d1c4217cad567cee",
         "type": "github"
       }
     },
