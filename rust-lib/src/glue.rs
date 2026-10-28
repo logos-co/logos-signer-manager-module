@@ -118,7 +118,8 @@ pub trait SignerManagerModule: Send + Sync + 'static {
     fn unattended_signatures(&self) -> String;
 
     // ── Wallets: each seed unlocked once per session, in the Signer app ─────
-    /// Every wallet: `{ ok, wallets: [{ seed, name, locked, kinds, privateName? }] }`. Tier B.
+    /// Every wallet: `{ ok, wallets: [{ seed, name, locked, kinds, privateName?, holderSeed?,
+    /// device?, wayIn? }] }`, the last three to its holders only. Tier B.
     fn wallets(&self) -> String;
     /// The caller's own key for a wallet's data: `{ seed, scope, generation? }`, `seed` a wallet's
     /// or `"profile"` → `{ ok, key, generation }`, or `code: locked`. Tier B: a module gets only
@@ -126,7 +127,8 @@ pub trait SignerManagerModule: Send + Sync + 'static {
     fn data_key(&self, params_json: String) -> String;
     /// A signer registers the seed it just added, with the holder's unlock key at index 0 when it
     /// gives one: `{ seed, kind, unlockKey?, name, origin?, birthday? }` → `{ ok, seed, new,
-    /// unlocked }`. `seed` in is the signer's own name for it. The configured signers only.
+    /// unlocked, device, wayIn }`, or `code: invalid` with `wallet` when the key is another
+    /// wallet's. `seed` in is the signer's own name for it. The configured signers only.
     fn enroll_seed(&self, params_json: String) -> String;
     /// The Signer app's view: `{ ok, wallets: [{ seed, name, privateName?, locked, holders, device,
     /// index, generation, ways: [{ id, factors: [{ kind, id?, name? }] }], alwaysUnlocked, origin?,
@@ -452,6 +454,9 @@ fn err(e: impl std::fmt::Display) -> String {
 
 /// A refusal carries the signer's code, so the approver can tell "try the password again".
 fn manager_err(e: &ManagerError) -> String {
+    if let ManagerError::Taken(wallet) = e {
+        return json!({ "ok": false, "code": "invalid", "error": e.to_string(), "wallet": wallet }).to_string();
+    }
     match e.wire_code() {
         Some(code) => json!({ "ok": false, "code": code, "error": e.to_string() }).to_string(),
         None => err(e),
@@ -1213,28 +1218,19 @@ impl Core {
             Ok(e) => {
                 self.wallets.note(&e.seed);
                 self.announce_wallets();
-                json!({ "ok": true, "seed": e.seed, "new": e.new, "unlocked": e.unlocked }).to_string()
+                json!({ "ok": true, "seed": e.seed, "new": e.new, "unlocked": e.unlocked, "device": e.device,
+                        "wayIn": e.way_in })
+                .to_string()
             }
             Err(e) => manager_err(&e),
         }
     }
 
     fn wallets(&mut self) -> String {
-        if self.named_caller().is_none() {
+        let Some(caller) = self.named_caller() else {
             return not_authorized();
-        }
-        let list: Vec<_> = self
-            .wallets
-            .store
-            .wallets()
-            .into_iter()
-            .map(|w| {
-                let mut kinds: Vec<String> = w.holders.iter().map(|h| h.kind.clone()).collect();
-                kinds.dedup();
-                json!({ "seed": w.seed, "name": w.name, "locked": w.locked, "kinds": kinds,
-                        "privateName": w.about.private_name })
-            })
-            .collect();
+        };
+        let list: Vec<_> = self.wallets.store.wallets().iter().map(|w| w.listed(&caller)).collect();
         json!({ "ok": true, "wallets": list }).to_string()
     }
 

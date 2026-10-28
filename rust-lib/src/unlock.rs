@@ -276,11 +276,32 @@ pub struct WalletView {
     pub about: About,
 }
 
+impl WalletView {
+    /// As `wallets()` lists it to `caller`. A holder also learns its own name for the seed and
+    /// whether it can be unlocked again.
+    pub fn listed(&self, caller: &str) -> serde_json::Value {
+        let mut kinds: Vec<String> = self.holders.iter().map(|h| h.kind.clone()).collect();
+        kinds.dedup();
+        let mut v = serde_json::json!({ "seed": self.seed, "name": self.name, "locked": self.locked,
+                                        "kinds": kinds, "privateName": self.about.private_name });
+        if let Some(h) = self.holders.iter().find(|h| h.signer == caller) {
+            v["holderSeed"] = h.seed.clone().into();
+            v["device"] = self.device.into();
+            v["wayIn"] = (!self.ways.is_empty()).into();
+        }
+        v
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct Enrolled {
     pub seed: String,
     pub new: bool,
     pub unlocked: bool,
+    /// Its unlock key is known: a way in may take the device.
+    pub device: bool,
+    /// It has a way in, so it can be unlocked after a lock.
+    pub way_in: bool,
 }
 
 #[derive(Default)]
@@ -486,7 +507,7 @@ impl Unlock {
                     let u = secrets.device.as_ref().ok_or_else(|| bad(format!("unlocking {} needs its device", rec.name)))?;
                     logos_signer_interface::unlock::check_unlock_key(&hex::encode(u.as_slice()))?;
                     if check.is_some_and(|c| c != check_of(u)) {
-                        return Err(signer_error(ErrorCode::WrongSeed, "this device holds another seed"));
+                        return Err(signer_error(ErrorCode::WrongSeed, format!("this device holds another seed than {}", rec.name)));
                     }
                     u.clone()
                 }
@@ -503,7 +524,8 @@ impl Unlock {
 
     /// A seed registers when a signer adds it, while the holder's unlock key is at hand: a new seed
     /// starts with "device only", or none for a holder that gives no unlock key, and is unlocked.
-    /// A seed already known by its holder or its unlock key gains the holder.
+    /// A seed already known by its holder or its unlock key gains the holder; a holder bringing
+    /// another wallet's key is refused.
     pub fn enroll(&mut self, holder: Holder, unlock_key: Option<&[u8]>, name: &str, about: About) -> Result<Enrolled> {
         self.usable()?;
         if holder.signer.trim().is_empty() || holder.seed.trim().is_empty() {
@@ -516,21 +538,36 @@ impl Unlock {
         let name = check_name(name, "name")?;
         let about = check_about(about)?;
         let identity = unlock_key.map(check_of);
-        let known = self.seeds.iter().position(|s| {
-            s.holders.iter().any(|h| h.signer == holder.signer && h.seed == holder.seed)
-                || (identity.is_some() && s.identity == identity)
-        });
-        if let Some(i) = known {
+        let by_holder = self
+            .seeds
+            .iter()
+            .position(|s| s.holders.iter().any(|h| h.signer == holder.signer && h.seed == holder.seed));
+        let by_identity = identity.as_ref().and_then(|i| self.seeds.iter().position(|s| s.identity.as_ref() == Some(i)));
+        if let (Some(a), Some(b)) = (by_holder, by_identity) {
+            if a != b {
+                return Err(ManagerError::Taken(self.seeds[b].name.clone()));
+            }
+        }
+        if let Some(i) = by_holder.or(by_identity) {
             let rec = &mut self.seeds[i];
             if !rec.holders.contains(&holder) {
                 rec.holders.retain(|h| h.signer != holder.signer || h.seed != holder.seed);
                 rec.holders.push(holder);
             }
-            if rec.identity.is_none() && rec.index == 0 {
+            let gains_key = rec.identity.is_none() && rec.index == 0 && identity.is_some();
+            if gains_key {
                 rec.identity = identity.clone();
                 rec.check = identity.clone();
             }
             let id = rec.id.clone();
+            // A seed open with no way in yet takes "device only" with its first key.
+            if let (true, true, Some(u), Some(key)) = (gains_key, rec.ways.is_empty(), unlock_key, self.open.get(&id).cloned()) {
+                let rec = self.seeds[i].clone();
+                let secrets = Secrets { device: Some(Zeroizing::new(u.to_vec())), ..Default::default() };
+                let keys = self.factor_keys(&rec, &[Factor::Device], &secrets, None)?;
+                self.seeds[i].ways.push(wrap_way(&rec, random_id("w_"), keys, &key));
+            }
+            let rec = &self.seeds[i];
             let device_only = (rec.index == 0).then(|| rec.ways.iter().find(|w| w.factors == [Factor::Device])).flatten();
             let device_only = device_only.map(|w| w.id.clone());
             // The unlock key at index 0 opens a known seed whose rule is still "device only".
@@ -539,7 +576,14 @@ impl Unlock {
                 let _ = self.unlock(&id, &way, &secrets);
             }
             self.save()?;
-            return Ok(Enrolled { unlocked: self.open.contains_key(&id), seed: id, new: false });
+            let rec = &self.seeds[i];
+            return Ok(Enrolled {
+                unlocked: self.open.contains_key(&id),
+                device: rec.identity.is_some(),
+                way_in: !rec.ways.is_empty(),
+                seed: id,
+                new: false,
+            });
         }
         let id = random_id("s_");
         let key = random_key();
@@ -570,10 +614,11 @@ impl Unlock {
         if let Some(p) = &self.profile {
             rec.profile = Some(seal(&key, p.as_ref(), &aad(&["profile", &id, "0"])));
         }
+        let (device, way_in) = (rec.identity.is_some(), !rec.ways.is_empty());
         self.seeds.push(rec);
         self.open.insert(id.clone(), key);
         self.save()?;
-        Ok(Enrolled { seed: id, new: true, unlocked: true })
+        Ok(Enrolled { seed: id, new: true, unlocked: true, device, way_in })
     }
 
     /// Unlock a seed by one of its ways in.
@@ -1239,6 +1284,66 @@ mod tests {
         let mut s = dir.store();
         let way = only_way(&s, &e.seed);
         s.unlock(&e.seed, &way, &typed(&[(&pw, "pw-qr")])).unwrap();
+    }
+
+    #[test]
+    fn a_keyless_seed_that_gains_its_key_takes_device_only() {
+        let dir = Dir::new();
+        let mut s = dir.store();
+        let first = s.enroll(holder("qr_signer_module", "fp"), None, "Shell", About::default()).unwrap();
+        assert!(!first.device && !first.way_in);
+        let k = s.data_key("core", &first.seed, "wallet", None).unwrap().0;
+        let again = s.enroll(holder("qr_signer_module", "fp"), Some(&u(1)), "Shell", About::default()).unwrap();
+        assert_eq!(again.seed, first.seed);
+        assert!(!again.new && again.unlocked && again.device && again.way_in);
+
+        let mut s = dir.store();
+        let way = only_way(&s, &first.seed);
+        assert_eq!(s.way(&first.seed, &way).unwrap(), vec![Factor::Device]);
+        assert_eq!(code(s.unlock(&first.seed, &way, &device(2))).as_deref(), Some("wrong_seed"));
+        s.unlock(&first.seed, &way, &device(1)).unwrap();
+        assert_eq!(s.data_key("core", &first.seed, "wallet", None).unwrap().0, k);
+    }
+
+    #[test]
+    fn a_keyless_seed_with_a_password_keeps_its_rule_when_it_gains_its_key() {
+        let mut s = Unlock::in_memory().with_cost(CHEAP);
+        let e = s.enroll(holder("qr_signer_module", "fp"), None, "Shell", About::default()).unwrap();
+        let pw = s.create_password("QR", "pw-qr").unwrap();
+        s.set_rule(&e.seed, &[vec![Factor::Password(pw.clone())]], &typed(&[(&pw, "pw-qr")])).unwrap();
+        let again = s.enroll(holder("qr_signer_module", "fp"), Some(&u(1)), "Shell", About::default()).unwrap();
+        assert!(again.device && again.way_in);
+        let ways = s.wallets().into_iter().find(|w| w.seed == e.seed).unwrap().ways;
+        assert_eq!(ways.len(), 1);
+        assert_eq!(ways[0].1, vec![Factor::Password(pw.clone())]);
+        s.set_rule(&e.seed, &[vec![Factor::Device]], &both(1, &[(&pw, "pw-qr")])).unwrap();
+    }
+
+    #[test]
+    fn a_holder_bringing_another_wallets_key_is_refused_and_nothing_changes() {
+        let mut s = Unlock::in_memory().with_cost(CHEAP);
+        let qr = s.enroll(holder("qr_signer_module", "fp"), None, "QR Shell", About::default()).unwrap().seed;
+        s.enroll(holder("keycard_shell_module", "mkid"), Some(&u(1)), "Shell", About::default()).unwrap();
+        let before = s.wallets();
+        let e = s.enroll(holder("qr_signer_module", "fp"), Some(&u(1)), "QR Shell", About::default()).unwrap_err();
+        assert_eq!(e.wire_code().as_deref(), Some("invalid"));
+        assert!(matches!(&e, ManagerError::Taken(w) if w == "Shell"), "{e}");
+        assert_eq!(s.wallets(), before);
+        assert_eq!(s.seed_of("qr_signer_module", "fp"), Some(qr));
+    }
+
+    #[test]
+    fn wallets_tell_a_holder_its_own_name_for_the_seed_and_no_one_else() {
+        let mut s = Unlock::in_memory().with_cost(CHEAP);
+        s.enroll(holder("keycard_module", "uid"), Some(&u(1)), "Card", About::default()).unwrap();
+        let w = &s.wallets()[0];
+        let mine = w.listed("keycard_module");
+        assert_eq!(mine["holderSeed"], "uid");
+        assert_eq!(mine["device"], true);
+        assert_eq!(mine["wayIn"], true);
+        let theirs = w.listed("bitcoin_wallet_core_module");
+        assert!(theirs.get("holderSeed").is_none() && theirs.get("device").is_none() && theirs.get("wayIn").is_none());
+        assert_eq!(theirs["name"], "Card");
     }
 
     #[test]
