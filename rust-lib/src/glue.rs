@@ -1166,13 +1166,14 @@ impl Core {
             Err(e) => return err(format!("data_key: {e}")),
         };
         let seed = match (&w.account, w.seed.trim().is_empty()) {
-            (Some(account), true) => match self.signers.seed_of_account(account) {
-                Some((holder, named)) => match self.wallets.store.seed_of(&holder, &named) {
+            (Some(account), true) => {
+                let listed = self.signers.seeds_of_account(account);
+                match self.wallets.store.seed_of_listed(&listed) {
                     Some(seed) => seed,
+                    None if listed.is_empty() => return json!({ "ok": false, "code": "unavailable", "error": "data_key: no signer lists this account" }).to_string(),
                     None => return json!({ "ok": false, "code": "unavailable", "error": "data_key: this account's wallet isn't known yet" }).to_string(),
-                },
-                None => return json!({ "ok": false, "code": "unavailable", "error": "data_key: no signer lists this account" }).to_string(),
-            },
+                }
+            }
             (None, false) => self.wallets.store.resolve(&module, &w.seed),
             _ => return err("data_key: name a seed or an account"),
         };

@@ -233,7 +233,9 @@ restart or a `lock_wallets`.
   scope, generation? })` answers it to the caller, named by its identity, or `locked`. A holder
   of the seed may name it its own way, as it lists it in `seed`. A module that knows an account
   and not its seed names the `account` instead, looked up among the accounts the signers last
-  listed (never asking one), and the answer names the `seed`. The current
+  listed (never asking one), and the answer names the `seed`. Every signer listing it is tried in
+  turn: a Keycard transport also lists its peer's accounts, under the peer's name for the seed,
+  which only the peer's holder record knows. The current
   generation is the default; an earlier one still answers, so a module reads its old data and
   writes it again under the new key in its own time. `"profile"` instead of a seed is a key for
   data of no wallet, such as contacts: any unlocked wallet opens it.

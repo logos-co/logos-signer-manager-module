@@ -445,6 +445,11 @@ impl Unlock {
             .map(|s| s.id.clone())
     }
 
+    /// The manager's seed for an account, from the first of its listings a holder made.
+    pub fn seed_of_listed(&self, listed: &[(String, String)]) -> Option<String> {
+        listed.iter().find_map(|(signer, named)| self.seed_of(signer, named))
+    }
+
     /// The seed a caller names: one of the manager's, or, from one of its holders, the seed as
     /// that holder names it.
     pub fn resolve(&self, caller: &str, named: &str) -> String {

@@ -199,17 +199,21 @@ impl Registry {
         }).collect()
     }
 
-    /// The signer that lists an account, by id or address, and the seed as it names it: from
-    /// what is already loaded, never asking a signer.
-    pub fn seed_of_account(&self, id: &str) -> Option<(String, String)> {
+    /// Every signer that lists an account, by id or address, in order, with the seed as it names
+    /// it: from what is already loaded, never asking a signer. A Keycard transport also lists its
+    /// peer's rows, under the peer's name for the seed, so the first may not be a holder.
+    pub fn seeds_of_account(&self, id: &str) -> Vec<(String, String)> {
         let id = id.trim();
-        self.entries.iter().find_map(|e| {
-            let a = e.accounts.iter().flatten().find(|a| {
-                a.seed.is_some()
-                    && (same_id(a, id) || a.address.as_deref().is_some_and(|ad| ad.eq_ignore_ascii_case(id)))
-            })?;
-            Some((e.name.clone(), a.seed.clone()?))
-        })
+        self.entries
+            .iter()
+            .filter_map(|e| {
+                let a = e.accounts.iter().flatten().find(|a| {
+                    a.seed.is_some()
+                        && (same_id(a, id) || a.address.as_deref().is_some_and(|ad| ad.eq_ignore_ascii_case(id)))
+                })?;
+                Some((e.name.clone(), a.seed.clone()?))
+            })
+            .collect()
     }
 
     /// Every account once, under its preferred available signer.
@@ -322,13 +326,34 @@ mod tests {
         let mut r = Registry::new();
         r.add("keycard_module", Box::new(Absent(asks.clone())));
         r.add("keystore_module", Box::new(MockSigner::new(MockOptions::default())));
-        assert_eq!(r.seed_of_account("0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"), None, "nothing loaded yet");
+        assert!(r.seeds_of_account("0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266").is_empty(), "nothing loaded yet");
         assert_eq!(asks.load(SeqCst), 0);
         let bitcoin = r.accounts().into_iter().find(|(_, a)| a.family != Family::Evm).unwrap().1.id;
-        let (holder, seed) = r.seed_of_account("0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266").unwrap();
+        let listed = r.seeds_of_account("0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266");
+        let [(holder, seed)] = listed.as_slice() else { panic!("{listed:?}") };
         assert_eq!(holder, "keystore_module");
-        assert_eq!(r.seed_of_account(&bitcoin).map(|(_, s)| s), Some(seed));
-        assert_eq!(r.seed_of_account("0x0000000000000000000000000000000000000001"), None);
+        assert_eq!(r.seeds_of_account(&bitcoin), listed);
+        assert!(r.seeds_of_account("0x0000000000000000000000000000000000000001").is_empty());
+        assert!(!seed.is_empty());
+    }
+
+    #[test]
+    fn a_reader_account_the_shell_lists_first_resolves_to_the_readers_wallet() {
+        // The Shell comes first and lists the reader's rows too, under the reader's name for the seed.
+        let mut r = Registry::new();
+        r.add("keycard_shell_module", Box::new(MockSigner::new(MockOptions::default())));
+        r.add("keycard_module", Box::new(MockSigner::new(MockOptions::default())));
+        r.accounts();
+        let listed = r.seeds_of_account("0xF39FD6E51AAD88F6F4CE6AB8827279CFFFB92266");
+        let names: Vec<_> = listed.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["keycard_shell_module", "keycard_module"]);
+        let named = &listed[1].1;
+        let mut store = crate::unlock::Unlock::in_memory();
+        let holder = crate::unlock::Holder { signer: "keycard_module".into(), seed: named.clone(), kind: "keycard".into() };
+        let wallet = store.enroll(holder, None, "Card", Default::default()).unwrap().seed;
+        assert_eq!(store.seed_of("keycard_shell_module", named), None, "the Shell isn't a holder");
+        assert_eq!(store.seed_of_listed(&listed), Some(wallet));
+        assert_eq!(store.seed_of_listed(&listed[..1]), None);
     }
 
     #[test]
