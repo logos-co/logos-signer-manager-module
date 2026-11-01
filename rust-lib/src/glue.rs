@@ -16,11 +16,11 @@ use logos_signer_interface::{
     UnlockKeyRequest,
 };
 
-use crate::access::{Access, Cover, Decision, Gate, KeyHolder, OpenedWallet, Role, Terms, Unlocked};
+use crate::access::{Access, ApproveParams, Cover, Decision, Gate, KeyHolder, Role, Terms, Unlocked};
 use crate::approval::{Approvals, Approved, Move};
 use crate::gate;
 use crate::registry::Registry;
-use crate::unlock::{About, Factor, Holder, Unlock};
+use crate::unlock::{About, EnrollParams, Factor, Holder, Unlock};
 use crate::wallets::{Begun, Then, Wallets};
 use crate::ManagerError;
 
@@ -77,9 +77,9 @@ pub trait SignerManagerModule: Send + Sync + 'static {
     /// one (`seed` names it while its seed is locked), or `{ family, network }` to let the person
     /// pick, create or restore one, with optional `unlock` terms and a `reason` → `{ ok, handle,
     /// receipt, state }`. Given in the Signer app, `fetch_result` returns `{ ok, result: { group,
-    /// family, chain, network, external, internal, fingerprint, seed, origin?, birthday? } }`, and
-    /// the caller takes its database key from `data_key`. The keys app's older path returns a
-    /// `databaseKey` and `unlocked` instead of `seed`. Tier B.
+    /// family, chain, network, external, internal, fingerprint, seed } }`, and the caller takes its
+    /// database key from `data_key`. The keys app's older path returns a `databaseKey` and
+    /// `unlocked` instead of `seed`. Tier B.
     fn request_open(&self, params_json: String) -> String;
     /// Ask for an account to stay unlocked: `{ account, ttlMs?, count?, apps?, confirm?, reason? }`
     /// → `{ ok, handle, receipt, state }`. The person decides the terms. Tier B.
@@ -93,8 +93,7 @@ pub trait SignerManagerModule: Send + Sync + 'static {
     fn acknowledge_access(&self, handle: String) -> String;
     /// The person decided: an approver's consent `{ handle, bundle_id, group? }`, once the wallet is
     /// unlocked (`code: locked` until then), or the custodian's `{ handle, bundle_id, group?,
-    /// password, unlock?, birthday? }` → `{ ok }`, or `{ ok: false, code }` with the request left on
-    /// screen.
+    /// password, unlock? }` → `{ ok }`, or `{ ok: false, code }` with the request left on screen.
     fn approve_access(&self, params_json: String) -> String;
     /// The person said no: the app that claimed it.
     fn reject_access(&self, handle: String) -> bool;
@@ -126,13 +125,12 @@ pub trait SignerManagerModule: Send + Sync + 'static {
     /// keys of its own.
     fn data_key(&self, params_json: String) -> String;
     /// A signer registers the seed it just added, with the holder's unlock key at index 0 when it
-    /// gives one: `{ seed, kind, unlockKey?, name, origin?, birthday? }` → `{ ok, seed, new,
-    /// unlocked, device, wayIn }`, or `code: invalid` with `wallet` when the key is another
-    /// wallet's. `seed` in is the signer's own name for it. The configured signers only.
+    /// gives one: `{ seed, kind, unlockKey?, name }` → `{ ok, seed, new, unlocked, device, wayIn }`,
+    /// or `code: invalid` with `wallet` when the key is another wallet's. `seed` in is the signer's
+    /// own name for it. The configured signers only.
     fn enroll_seed(&self, params_json: String) -> String;
     /// The Signer app's view: `{ ok, wallets: [{ seed, name, privateName?, locked, holders, device,
-    /// index, generation, ways: [{ id, factors: [{ kind, id?, name? }] }], alwaysUnlocked, origin?,
-    /// birthday? }],
+    /// index, generation, ways: [{ id, factors: [{ kind, id?, name? }] }], alwaysUnlocked }],
     /// passwords: [{ id, name, wallets }] }`. `device`: its holders give an unlock key, so a way
     /// may take the device. Approvers.
     fn wallet_settings(&self) -> String;
@@ -343,32 +341,20 @@ fn keystore_reply(reply: Result<String, logos_rust_sdk::LogosError>) -> crate::R
     Ok(logos_signer_interface::wire::parse_reply(&reply)?)
 }
 
-/// What the keystore released for an open: the key, and where the wallet's history starts.
-fn opened_wallet(v: &serde_json::Value) -> OpenedWallet {
-    let key = v.get("databaseKey").and_then(|k| k.as_str()).unwrap_or_default();
-    // A keystore from before origins were kept says neither: the wallet core then scans the most.
-    let origin = v.get("origin").and_then(|o| o.as_str()).filter(|o| *o == "created").unwrap_or("restored");
-    let birthday = v.get("birthday").and_then(|b| b.as_str()).filter(|b| is_day(b)).map(str::to_string);
-    OpenedWallet { database_key: Zeroizing::new(key.to_string()), origin: origin.into(), birthday }
-}
-
-/// `YYYY-MM-DD`, as the keystore writes a birthday; anything else is dropped, not passed on.
-fn is_day(s: &str) -> bool {
-    s.len() == 10 && s.bytes().enumerate().all(|(i, c)| if i == 4 || i == 7 { c == b'-' } else { c.is_ascii_digit() })
+/// The database key the keystore released for an open.
+fn released_key(v: &serde_json::Value) -> Zeroizing<String> {
+    Zeroizing::new(v.get("databaseKey").and_then(|k| k.as_str()).unwrap_or_default().to_string())
 }
 
 impl KeyHolder for KeystoreKeys {
-    fn database_key(&mut self, group: &str, password: Option<&str>) -> crate::Result<OpenedWallet> {
+    fn database_key(&mut self, group: &str, password: Option<&str>) -> crate::Result<Zeroizing<String>> {
         let body = Zeroizing::new(json!({ "group": group, "password": password }).to_string());
-        Ok(opened_wallet(&keystore_reply(modules().keystore_module.database_key(&body))?))
+        Ok(released_key(&keystore_reply(modules().keystore_module.database_key(&body))?))
     }
 
-    fn device_database_key(&mut self, signer: &str, account: &str, password: &str, birthday: Option<&str>)
-        -> crate::Result<OpenedWallet> {
-        let body = Zeroizing::new(
-            json!({ "signer": signer, "account": account, "password": password, "birthday": birthday }).to_string(),
-        );
-        Ok(opened_wallet(&keystore_reply(modules().keystore_module.device_database_key(&body))?))
+    fn device_database_key(&mut self, signer: &str, account: &str, password: &str) -> crate::Result<Zeroizing<String>> {
+        let body = Zeroizing::new(json!({ "signer": signer, "account": account, "password": password }).to_string());
+        Ok(released_key(&keystore_reply(modules().keystore_module.device_database_key(&body))?))
     }
 
     fn device_wallets(&mut self) -> crate::Result<Vec<(String, String)>> {
@@ -912,23 +898,7 @@ impl Core {
         let Some((name, role)) = self.access_gate() else {
             return not_authorized();
         };
-        #[derive(serde::Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Wire {
-            handle: String,
-            bundle_id: String,
-            #[serde(default)]
-            group: Option<String>,
-            /// The custodian's path; an approver's consent carries none.
-            #[serde(default)]
-            password: Option<String>,
-            #[serde(default)]
-            unlock: Option<Terms>,
-            /// A device wallet's first day of use, at its first open.
-            #[serde(default)]
-            birthday: Option<String>,
-        }
-        let w: Wire = match serde_json::from_str(&params_json) {
+        let w: ApproveParams = match serde_json::from_str(&params_json) {
             Ok(w) => w,
             Err(e) => return err(format!("approve_access: {e}")),
         };
@@ -939,9 +909,8 @@ impl Core {
             let gate = Gate { caller: &name, role: Role::Approver };
             self.access.consent(&mut self.signers, &self.wallets.store, &w.handle, &w.bundle_id, w.group, &gate)
         } else {
-            let birthday = w.birthday.map(|b| b.trim().to_string()).filter(|b| !b.is_empty());
             let password = w.password.unwrap_or_default();
-            let decision = Decision { group: w.group, password, unlock: w.unlock, birthday };
+            let decision = Decision { group: w.group, password, unlock: w.unlock };
             let gate = Gate { caller: &name, role };
             self.access.approve(&mut self.signers, &mut KeystoreKeys, &w.handle, &w.bundle_id, decision, &gate)
         };
@@ -1190,21 +1159,7 @@ impl Core {
         let Some(signer) = self.is_signer() else {
             return not_authorized();
         };
-        #[derive(serde::Deserialize)]
-        #[serde(rename_all = "camelCase", deny_unknown_fields)]
-        struct Wire {
-            seed: String,
-            #[serde(default)]
-            kind: String,
-            #[serde(default)]
-            unlock_key: Option<String>,
-            name: String,
-            #[serde(default)]
-            origin: Option<String>,
-            #[serde(default)]
-            birthday: Option<String>,
-        }
-        let w: Wire = match secret_params(params_json) {
+        let w: EnrollParams = match secret_params(params_json) {
             Ok(w) => w,
             Err(e) => return err(format!("enroll_seed: {e}")),
         };
@@ -1214,8 +1169,7 @@ impl Core {
             None => None,
         };
         let holder = Holder { signer, seed: w.seed, kind: w.kind };
-        let about = About { private_name: None, origin: w.origin, birthday: w.birthday };
-        match self.wallets.store.enroll(holder, key.as_ref().map(|k| k.as_slice()), &w.name, about) {
+        match self.wallets.store.enroll(holder, key.as_ref().map(|k| k.as_slice()), &w.name, About::default()) {
             Ok(e) => {
                 self.wallets.note(&e.seed);
                 self.announce_wallets();
@@ -1256,7 +1210,7 @@ impl Core {
                 let always = w.ways.iter().any(|(_, f)| f.is_empty());
                 json!({ "seed": w.seed, "name": w.name, "privateName": w.about.private_name, "locked": w.locked,
                         "holders": w.holders, "device": w.device, "index": w.index, "generation": w.generation,
-                        "ways": ways, "alwaysUnlocked": always, "origin": w.about.origin, "birthday": w.about.birthday })
+                        "ways": ways, "alwaysUnlocked": always })
             })
             .collect();
         let passwords: Vec<_> = store

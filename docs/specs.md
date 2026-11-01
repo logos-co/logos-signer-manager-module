@@ -124,7 +124,7 @@ refuse or stall a request, but it can't get a false signature past the checks ab
 | `wallets` | — | `{ ok, wallets: [{ seed, name, locked, kinds, privateName?, holderSeed?, device?, wayIn? }] }`; the last three only to a holder of that wallet |
 | `data_key` | `params_json` | `{ ok, key, generation, seed }`, or `{ ok: false, code: "locked" }` |
 | `enroll_seed` | `params_json` | `{ ok, seed, new, unlocked, device, wayIn }`, or `{ ok: false, code: "invalid", error, wallet }` |
-| `wallet_settings` | — | `{ ok, wallets: [{ seed, name, privateName?, locked, holders, device, index, generation, ways, origin?, birthday? }], passwords: [{ id, name, wallets }] }`; `device`: its holders give an unlock key |
+| `wallet_settings` | — | `{ ok, wallets: [{ seed, name, privateName?, locked, holders, device, index, generation, ways }], passwords: [{ id, name, wallets }] }`; `device`: its holders give an unlock key |
 | `unlock_wallet`, `set_rule`, `change_keys` | `params_json` | `{ ok, state: "done" }`, or `{ ok, state: "device", handle }`, or `{ ok: false, code, error }` |
 | `unlock_progress` | `handle` | `{ ok, state, seed, step?, code?, error? }` |
 | `cancel_unlock` | `handle` | `bool` |
@@ -253,13 +253,14 @@ restart or a `lock_wallets`.
 - **Passwords** are named and shared: one can unlock several wallets. Each has a key of its own
   under its scrypt output (N = 2^17, r = 8, p = 1), so `change_password` touches no wallet, and
   `remove_password` is refused while a rule takes it. Their names show in the clear.
-- **Names.** A wallet's public `name` shows while it is locked; its private name, origin and
-  birthday are sealed under its seed key and show once it is unlocked.
+- **Names.** A wallet's public `name` shows while it is locked; its private name is sealed under
+  its seed key and shows once it is unlocked.
 - **Adding.** A signer calls `enroll_seed` from its add flow, while the holder's unlock key at
-  index 0 is at hand, so adding never asks twice: `{ seed, kind, unlockKey?, name, origin?,
-  birthday? }`, where `seed` is the signer's own name for the seed (a Keycard's key UID, a Shell's
-  master key id, a QR wallet's master fingerprint, a keystore wallet's id). A new wallet is
-  unlocked at once. A seed already known, by that holder or by its unlock key, gains the holder.
+  index 0 is at hand, so adding never asks twice: `{ seed, kind, unlockKey?, name }`, where `seed`
+  is the signer's own name for the seed (a Keycard's key UID, a Shell's master key id, a QR
+  wallet's master fingerprint, a keystore wallet's id). Older signers also send `origin` and
+  `birthday`; they are ignored. A new wallet is unlocked at once. A seed already known, by that
+  holder or by its unlock key, gains the holder.
   A known seed with no unlock key yet, open and with no way in, takes "device only" when its
   holder brings the key; a rule it already has stays. A holder whose key is another wallet's is
   refused with `code: "invalid"` and that wallet's name in `wallet`, and nothing changes.
@@ -288,9 +289,9 @@ terms a person chose.
 - **Consent.** An approver claims an open with `acknowledge_access`, which names the wallet's
   `seed` so the app shows it beside the wallet, and approves it with `{ handle, bundle_id, group?
   }`. A locked wallet answers `code: locked` and the request stays on screen. The result is `{
-  group, family, chain, network, external, internal, fingerprint, seed, origin?, birthday? }`, with
-  no database key: the module takes its own from `data_key(seed, …)`. A request may name the wallet
-  by `{ group, seed }` while its seed is locked and no signer lists it; it is checked once unlocked.
+  group, family, chain, network, external, internal, fingerprint, seed }`, with no database key:
+  the module takes its own from `data_key(seed, …)`. A request may name the wallet by `{ group,
+  seed }` while its seed is locked and no signer lists it; it is checked once unlocked.
   An approver decides opens only, and the first app to claim a request keeps it.
 
 - `request_open` takes `{ group, network? }` to reopen a wallet, or `{ family, network }` to let the
@@ -298,36 +299,28 @@ terms a person chose.
   belong to the wallet's chain (`main` or `test`); a request naming the wrong one is refused before
   anything is shown. It answers `{ ok, handle, receipt, state }`. Once the custodian approves,
   `fetch_result` with the receipt returns `{ ok, result: { group, family, chain, network, external,
-  internal, fingerprint, databaseKey, origin, birthday, unlocked } }`, `network` being the one the
-  request named, and the wallet is **open** for that module: `account_descriptors(group)`, the
-  wallet's id as a plain string, answers `{ ok, group, external, internal }` to it again, and to
-  nobody else. `close_account` (`{ group }`) ends that; an unlock scoped to the module alone ends
-  with it.
-- **Where a wallet's history starts.** `origin` is `created` when the keys app made the wallet's
-  phrase for it, and `birthday` is then the day it was made: no coin can have reached it before.
-  Otherwise it is `restored`, with the day the person gave as `birthday`, or `null`. A wallet core
-  starts scanning at the birthday, or, for a restored wallet without one, where its family began:
-  segwit's activation for `bitcoin`, taproot's for `bitcoin_taproot`. Both come from the keystore's
-  record, so a wallet made before it kept them reads `restored`, with no birthday.
+  internal, fingerprint, databaseKey, unlocked } }`, `network` being the one the request named,
+  and the wallet is **open** for that module: `account_descriptors(group)`, the wallet's id as a
+  plain string, answers `{ ok, group, external, internal }` to it again, and to nobody else.
+  `close_account` (`{ group }`) ends that; an unlock scoped to the module alone ends with it.
+- Where a wallet's history starts is not the manager's to say: the Bitcoin wallet core keeps each
+  account's birthday itself.
 - `request_unlock` takes `{ account, ttlMs?, count?, apps?, confirm?, reason? }`, the terms an app
   asks for. `fetch_result` returns `{ ok, result: { account, terms, expiresInMs, countLeft } }`:
   the terms the person granted, which may differ.
 - **A device account** is one any signer but the keystore offers. Its database key comes from the
   keystore's `device_database_key`, made at the first open under the password the person sets in
-  the keys app, with the first day of use they give as `birthday` in `approve_access`. Every later
-  open needs that password. A device signs on its own screen, so it has nothing to unlock: terms in
-  the decision are refused, the app's own are not granted, and `request_unlock` for it is refused
-  before anything is shown. Its `origin` is always `restored`, since a device keeps no record of
-  when its seed was made. A keystore wallet's birthday was set when it was made, so a decision
-  that gives one for it is refused.
+  the keys app. Every later open needs that password. A device signs on its own screen, so it has
+  nothing to unlock: terms in the decision are refused, the app's own are not granted, and
+  `request_unlock` for it is refused before anything is shown.
 - A requester has at most two open or unlock requests pending, and one nobody shows within five
   minutes settles `expired_no_ack`.
 - The custodian (the keys app) works the queue with `access_requests`, `acknowledge_access` (the
   lines to show, the commitment to echo, and `asked`: the wallet or the family and network to pick
-  from, and the terms the app wants), `approve_access` (`{ handle, bundle_id, group?,
-  password, unlock?, birthday? }`) and `reject_access`. A wrong password answers `code: wrong_secret` and
-  leaves the request on screen. The database key comes from the keystore's `database_key`, the
-  unlock from its `unlock`; the manager keeps neither.
+  from, and the terms the app wants), `approve_access` (`{ handle, bundle_id, group?, password,
+  unlock? }`, an older keys app's `birthday` ignored) and `reject_access`. A wrong password answers
+  `code: wrong_secret` and leaves the request on screen. The database key comes from the
+  keystore's `database_key`, the unlock from its `unlock`; the manager keeps neither.
 - The keys app also unlocks and locks on its own: `unlock` (`{ account, password, ttlMs?,
   count?, apps, confirm? }`) and `lock` (`{ account? }`, everything for `{}`). `unlocked` lists
   every unlock with its apps and confirmation, and `open_accounts` every open wallet.

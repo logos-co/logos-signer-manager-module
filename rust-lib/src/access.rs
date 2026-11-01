@@ -13,6 +13,7 @@
 use std::time::{Duration, Instant};
 
 use rand::RngCore;
+use serde::de::IgnoredAny;
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
@@ -29,24 +30,14 @@ pub const MAX_PENDING_PER_REQUESTER: usize = 2;
 pub const SETTLED_RETENTION: Duration = Duration::from_secs(120);
 pub const ABANDONED_OFFER_TTL: Duration = Duration::from_secs(300);
 
-/// What the keystore hands over when a wallet opens: its database key, and where its history can start.
-pub struct OpenedWallet {
-    pub database_key: Zeroizing<String>,
-    /// `created` or `restored`.
-    pub origin: String,
-    /// The wallet's first possible day, `YYYY-MM-DD`, when known.
-    pub birthday: Option<String>,
-}
-
 // The signer whose Bitcoin wallets keep their database key in their own vault; any other is a device.
 use crate::roster::KEYSTORE;
 
 /// What the keystore does for an open or an unlock, beyond the signer interface.
 pub trait KeyHolder {
-    fn database_key(&mut self, group: &str, password: Option<&str>) -> Result<OpenedWallet>;
+    fn database_key(&mut self, group: &str, password: Option<&str>) -> Result<Zeroizing<String>>;
     /// A device account's database key, made at its first open under the password the person set.
-    fn device_database_key(&mut self, signer: &str, account: &str, password: &str, birthday: Option<&str>)
-        -> Result<OpenedWallet>;
+    fn device_database_key(&mut self, signer: &str, account: &str, password: &str) -> Result<Zeroizing<String>>;
     /// The device wallets that have a database key, as `(signer, account)`.
     fn device_wallets(&mut self) -> Result<Vec<(String, String)>>;
     fn unlock(&mut self, account: &str, password: &str, ttl_ms: Option<u64>, count: Option<u32>) -> Result<Unlocked>;
@@ -225,8 +216,24 @@ pub struct Decision {
     pub group: Option<String>,
     pub password: String,
     pub unlock: Option<Terms>,
-    /// A device wallet's first day of use, given at its first open.
-    pub birthday: Option<String>,
+}
+
+/// `approve_access`'s params: an approver's consent, or the custodian's decision.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApproveParams {
+    pub handle: String,
+    pub bundle_id: String,
+    #[serde(default)]
+    pub group: Option<String>,
+    /// The custodian's path; an approver's consent carries none.
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub unlock: Option<Terms>,
+    /// Older keys apps still send a device wallet's birthday; ignored.
+    #[serde(default, rename = "birthday")]
+    _birthday: IgnoredAny,
 }
 
 pub struct Shown {
@@ -575,12 +582,10 @@ impl Access {
         if let Some(n) = &p.network {
             acct.chain.network(n)?;
         }
-        let about = wallets.about(&seed)?;
         let result = serde_json::json!({
             "group": group, "family": found.account.family, "chain": acct.chain.as_str(), "network": p.network,
             "external": acct.descriptor(0), "internal": acct.descriptor(1),
             "fingerprint": acct.fingerprint.to_string(), "seed": seed,
-            "origin": about.origin, "birthday": about.birthday,
         });
         let requester = r.requester.clone();
         self.grants.retain(|(m, g)| !(m == &requester && g == &group));
@@ -630,13 +635,10 @@ impl Access {
                 if on_device && decision.unlock.is_some() {
                     return Err(bad("approve_access: a device account signs on its device; there is nothing to unlock"));
                 }
-                if !on_device && decision.birthday.is_some() {
-                    return Err(bad("approve_access: a keystore wallet's birthday was set when it was made"));
-                }
                 let terms = if on_device { None } else { decision.unlock.or_else(|| p.unlock.clone()) };
-                let opened = if on_device {
+                let database_key = if on_device {
                     let (signer, account) = database_holder(signers, keys, &found)?;
-                    keys.device_database_key(&signer, &account, &password, decision.birthday.as_deref())?
+                    keys.device_database_key(&signer, &account, &password)?
                 } else {
                     keys.database_key(&group, Some(&password))?
                 };
@@ -651,8 +653,8 @@ impl Access {
                 let result = serde_json::json!({
                     "group": group, "family": found.account.family, "chain": acct.chain.as_str(), "network": p.network,
                     "external": acct.descriptor(0), "internal": acct.descriptor(1),
-                    "fingerprint": acct.fingerprint.to_string(), "databaseKey": opened.database_key.as_str(),
-                    "origin": opened.origin, "birthday": opened.birthday, "unlocked": terms,
+                    "fingerprint": acct.fingerprint.to_string(), "databaseKey": database_key.as_str(),
+                    "unlocked": terms,
                 });
                 self.grants.retain(|(m, g)| !(m == &requester && g == &group));
                 self.grants.push((requester.clone(), group));
@@ -832,37 +834,33 @@ pub(crate) mod tests {
     #[derive(Default)]
     pub(crate) struct FakeKeys {
         pub unlocks: Vec<Unlocked>,
-        /// Device wallets by signer and account: their password, key and birthday.
-        pub devices: std::collections::HashMap<(String, String), (String, String, Option<String>)>,
+        /// Device wallets by signer and account: their password and key.
+        pub devices: std::collections::HashMap<(String, String), (String, String)>,
     }
 
     impl KeyHolder for FakeKeys {
-        fn database_key(&mut self, _: &str, password: Option<&str>) -> Result<OpenedWallet> {
+        fn database_key(&mut self, _: &str, password: Option<&str>) -> Result<Zeroizing<String>> {
             match password {
-                Some("pw") => Ok(OpenedWallet {
-                    database_key: Zeroizing::new("ab".repeat(32)),
-                    origin: "restored".into(),
-                    birthday: Some("2021-11-14".into()),
-                }),
+                Some("pw") => Ok(Zeroizing::new("ab".repeat(32))),
                 _ => Err(ManagerError::Signer(logos_signer_interface::SignerError::new(
                     logos_signer_interface::ErrorCode::WrongSecret,
                     "the password for this account is not correct",
                 ))),
             }
         }
-        fn device_database_key(&mut self, signer: &str, account: &str, password: &str, birthday: Option<&str>)
-            -> Result<OpenedWallet> {
+        fn device_database_key(&mut self, signer: &str, account: &str, password: &str) -> Result<Zeroizing<String>> {
             let n = self.devices.len() + 1;
-            let (pw, key, day) = self.devices.entry((signer.into(), account.into())).or_insert_with(|| {
-                (password.into(), format!("{n:02x}").repeat(32), birthday.map(str::to_string))
-            });
+            let (pw, key) = self
+                .devices
+                .entry((signer.into(), account.into()))
+                .or_insert_with(|| (password.into(), format!("{n:02x}").repeat(32)));
             if pw != password {
                 return Err(ManagerError::Signer(logos_signer_interface::SignerError::new(
                     logos_signer_interface::ErrorCode::WrongSecret,
                     "the password for this wallet's database key is not correct",
                 )));
             }
-            Ok(OpenedWallet { database_key: Zeroizing::new(key.clone()), origin: "restored".into(), birthday: day.clone() })
+            Ok(Zeroizing::new(key.clone()))
         }
         fn device_wallets(&mut self) -> Result<Vec<(String, String)>> {
             Ok(self.devices.keys().cloned().collect())
@@ -915,7 +913,7 @@ pub(crate) mod tests {
     }
 
     fn decide(group: Option<&str>, password: &str, unlock: Option<Terms>) -> Decision {
-        Decision { group: group.map(str::to_string), password: password.into(), unlock, birthday: None }
+        Decision { group: group.map(str::to_string), password: password.into(), unlock }
     }
 
     /// A device's module offering the mock's accounts, and no keystore.
@@ -934,27 +932,20 @@ pub(crate) mod tests {
             let bundle = a.acknowledge(s, &Unlock::in_memory(), &h, &KEYS).unwrap().bundle_id;
             (h, r, bundle)
         };
-        let decision = |pw: &str, unlock: Option<Terms>, birthday: Option<&str>| Decision {
-            group: None,
-            password: pw.into(),
-            unlock,
-            birthday: birthday.map(str::to_string),
-        };
         let (h, r, b) = open(&mut a, &mut s);
         let terms = Terms { ttl_ms: Some(1000), confirm: true, ..Default::default() };
-        assert!(a.approve(&mut s, &mut k, &h, &b, decision("data-pw", Some(terms), None), &KEYS).is_err(), "nothing to unlock");
-        a.approve(&mut s, &mut k, &h, &b, decision("data-pw", None, Some("2021-11-14")), &KEYS).unwrap();
+        assert!(a.approve(&mut s, &mut k, &h, &b, decide(None, "data-pw", Some(terms)), &KEYS).is_err(), "nothing to unlock");
+        a.approve(&mut s, &mut k, &h, &b, decide(None, "data-pw", None), &KEYS).unwrap();
         let got = a.fetch(&h, &r).unwrap();
-        assert_eq!((got["origin"].as_str(), got["birthday"].as_str()), (Some("restored"), Some("2021-11-14")));
         assert_eq!(got["unlocked"], serde_json::Value::Null, "the app asked for terms; a device grants none");
         assert!(k.devices.contains_key(&("keycard_shell_module".to_string(), "mock-segwit".to_string())));
         let first = got["databaseKey"].as_str().unwrap().to_string();
 
         // Opened again: the same key, behind the password set the first time.
         let (h, r, b) = open(&mut a, &mut s);
-        assert!(a.approve(&mut s, &mut k, &h, &b, decision("nope", None, None), &KEYS).is_err());
+        assert!(a.approve(&mut s, &mut k, &h, &b, decide(None, "nope", None), &KEYS).is_err());
         assert_eq!(a.status(&h, &r).unwrap().0, "rendered", "a wrong password leaves it on screen");
-        a.approve(&mut s, &mut k, &h, &b, decision("data-pw", None, None), &KEYS).unwrap();
+        a.approve(&mut s, &mut k, &h, &b, decide(None, "data-pw", None), &KEYS).unwrap();
         assert_eq!(a.fetch(&h, &r).unwrap()["databaseKey"].as_str(), Some(first.as_str()));
 
         // And an unlock is refused before anything is shown.
@@ -970,7 +961,7 @@ pub(crate) mod tests {
         let (mut k, mut a) = (FakeKeys::default(), Access::new());
         // First opened through the Shell; now the card is in a reader, which is preferred.
         let shell = ("keycard_shell_module".to_string(), "mock-segwit".to_string());
-        k.devices.insert(shell.clone(), ("data-pw".into(), "cd".repeat(32), None));
+        k.devices.insert(shell.clone(), ("data-pw".into(), "cd".repeat(32)));
         assert_eq!(s.find("mock-segwit").unwrap().name, "keycard_module");
         let (h, r) = a.request_open(&mut s, &Unlock::in_memory(), "bitcoin_wallet_core_module", r#"{"group":"mock-segwit"}"#).unwrap();
         let bundle = a.acknowledge(&mut s, &Unlock::in_memory(), &h, &KEYS).unwrap().bundle_id;
@@ -980,12 +971,19 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_keystore_wallet_takes_no_birthday_at_open() {
-        let (mut s, mut k, mut a) = fixture();
-        let (h, _) = a.request_open(&mut s, &Unlock::in_memory(), "bitcoin_wallet_core_module", r#"{"group":"mock-segwit","network":"regtest"}"#).unwrap();
+    fn an_older_keys_apps_birthday_still_approves_and_goes_nowhere() {
+        let (mut s, mut k, mut a) = device_fixture();
+        let (h, r) = a.request_open(&mut s, &Unlock::in_memory(), "bitcoin_wallet_core_module", OPEN).unwrap();
         let bundle = a.acknowledge(&mut s, &Unlock::in_memory(), &h, &KEYS).unwrap().bundle_id;
-        let d = Decision { group: None, password: "pw".into(), unlock: None, birthday: Some("2021-11-14".into()) };
-        assert!(a.approve(&mut s, &mut k, &h, &bundle, d, &KEYS).is_err(), "it was set when the wallet was made");
+        let sent = format!(r#"{{"handle":"{h}","bundle_id":"{bundle}","password":"data-pw","birthday":"2021-11-14"}}"#);
+        let p: ApproveParams = serde_json::from_str(&sent).unwrap();
+        let d = Decision { group: p.group, password: p.password.unwrap(), unlock: p.unlock };
+        a.approve(&mut s, &mut k, &p.handle, &p.bundle_id, d, &KEYS).unwrap();
+        let got = a.fetch(&h, &r).unwrap();
+        assert!(got.get("birthday").is_none() && got.get("origin").is_none(), "{got}");
+        assert!(got["databaseKey"].is_string());
+        let unknown = r#"{"handle":"h","bundle_id":"b","origin":"restored"}"#;
+        assert!(serde_json::from_str::<ApproveParams>(unknown).is_err(), "only the field older apps sent");
     }
 
     #[test]
@@ -1004,7 +1002,6 @@ pub(crate) mod tests {
         assert_eq!(got["group"], "mock-segwit");
         assert_eq!((got["chain"].as_str(), got["network"].as_str()), (Some("test"), Some("signet")));
         assert_eq!(got["databaseKey"], "ab".repeat(32));
-        assert_eq!((got["origin"].as_str(), got["birthday"].as_str()), (Some("restored"), Some("2021-11-14")));
         assert!(got["external"].as_str().unwrap().starts_with("wpkh(["));
         let (ext, _) = a.descriptors(&mut s, "bitcoin_wallet_core_module", "mock-segwit").unwrap();
         assert_eq!(ext, got["external"].as_str().unwrap());
@@ -1107,8 +1104,7 @@ pub(crate) mod tests {
         let key = hex::decode(card.unlock_key_result(&job).unwrap().key.expose()).unwrap();
         let mut w = Unlock::in_memory();
         let holder = crate::unlock::Holder { signer: "keycard_module".into(), seed: recogniser, kind: "keycard".into() };
-        let about = crate::unlock::About { origin: Some("restored".into()), birthday: Some("2021-11-14".into()), private_name: None };
-        let seed = w.enroll(holder, Some(&key), "Card", about).unwrap().seed;
+        let seed = w.enroll(holder, Some(&key), "Card", crate::unlock::About::default()).unwrap().seed;
         w.lock(None);
         let mut r = Registry::new();
         r.add("keycard_module", Box::new(card));
@@ -1136,7 +1132,6 @@ pub(crate) mod tests {
         a.consent(&mut s, &w, &h, &shown.bundle_id, None, &SIGNER).unwrap();
         let got = a.fetch(&h, &r).unwrap();
         assert_eq!((got["seed"].as_str(), got["network"].as_str()), (Some(seed.as_str()), Some("regtest")));
-        assert_eq!((got["origin"].as_str(), got["birthday"].as_str()), (Some("restored"), Some("2021-11-14")));
         assert!(got.get("databaseKey").is_none(), "{got}");
         assert!(got["external"].as_str().unwrap().starts_with("wpkh(["));
         assert!(a.descriptors(&mut s, "bitcoin_wallet_core_module", "mock-segwit").is_ok());

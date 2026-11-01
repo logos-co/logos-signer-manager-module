@@ -210,16 +210,14 @@ sections:
     text: |
       A wallet's descriptors and database key reach a module only once a person opens the wallet
       for it in the keys app. The module asks for any native segwit wallet on regtest; the person
-      picks one, here restored from the same test phrase with the day it was first used, and types
-      its password. Opening says where the wallet's history starts, so the module knows where to
-      begin scanning.
+      picks one, here restored from the same test phrase, and types its password.
     steps:
       - title: "Make a Bitcoin wallet, as the keystore's custodian"
         run: |
-          ./logos/bin/logosctl --config-dir ./session call manager_probe import_bitcoin '{"phrase":"test test test test test test test test test test test junk","family":"bitcoin","chain":"test","password":"pw","label":"Savings","origin":"restored","birthday":"2021-11-14"}' > wallet.json
+          ./logos/bin/logosctl --config-dir ./session call manager_probe import_bitcoin '{"phrase":"test test test test test test test test test test test junk","family":"bitcoin","chain":"test","password":"pw","label":"Savings"}' > wallet.json
           python3 -c 'import json; open("group", "w").write(json.loads(json.load(open("wallet.json"))["result"])["group"])'
           cat wallet.json
-        code_block: "logosctl call manager_probe import_bitcoin '{\"phrase\":\"test … junk\",\"family\":\"bitcoin\",\"chain\":\"test\",\"password\":\"pw\",\"label\":\"Savings\",\"origin\":\"restored\",\"birthday\":\"2021-11-14\"}'"
+        code_block: "logosctl call manager_probe import_bitcoin '{\"phrase\":\"test … junk\",\"family\":\"bitcoin\",\"chain\":\"test\",\"password\":\"pw\",\"label\":\"Savings\"}'"
         expect_contains:
           - "wpkh(["
       - title: "Ask to open one, and show it, as the keys app"
@@ -247,8 +245,6 @@ sections:
         expect_contains:
           - '\"code\":\"wrong_secret\"'
           - "databaseKey"
-          - '\"origin\":\"restored\"'
-          - '\"birthday\":\"2021-11-14\"'
           - "wpkh([16a93ed0/84'/1'/0']tpub"
       - title: "Its descriptors again, for this module only"
         run: |
@@ -427,22 +423,19 @@ sections:
         text: |
           A wallet whose key is on a device still needs a key for the app's database. The keystore
           keeps one for it, made the first time the wallet is opened, behind a password the person
-          sets then. A device keeps no record of when its seed was made, so the wallet is `restored`,
-          with the first day of use the person gives.
+          sets then.
         run: |
           ./logos/bin/logosctl --config-dir ./session call manager_probe open '{"group":"mock-segwit","network":"regtest"}' > dopen.json
           python3 -c 'import json; r = json.loads(json.load(open("dopen.json"))["result"]); open("dhandle", "w").write(r["handle"]); open("dreceipt", "w").write(r["receipt"])'
           ./logos/bin/logosctl --config-dir ./session call manager_probe show "$(cat dhandle)" > dshown.json
           python3 -c 'import json; open("dbundle", "w").write(json.loads(json.load(open("dshown.json"))["result"])["bundle_id"])'
-          ./logos/bin/logosctl --config-dir ./session call manager_probe decide "{\"handle\":\"$(cat dhandle)\",\"bundle_id\":\"$(cat dbundle)\",\"password\":\"data-pw\",\"birthday\":\"2021-11-14\"}"
+          ./logos/bin/logosctl --config-dir ./session call manager_probe decide "{\"handle\":\"$(cat dhandle)\",\"bundle_id\":\"$(cat dbundle)\",\"password\":\"data-pw\"}"
           ./logos/bin/logosctl --config-dir ./session call manager_probe fetch "$(cat dhandle)" "$(cat dreceipt)" | tee dfetch.json
         code_block: |
           logosctl call manager_probe open '{"group":"mock-segwit","network":"regtest"}'
-          logosctl call manager_probe decide '{"handle":"<handle>","bundle_id":"<bundle_id>","password":"data-pw","birthday":"2021-11-14"}'
+          logosctl call manager_probe decide '{"handle":"<handle>","bundle_id":"<bundle_id>","password":"data-pw"}'
           logosctl call manager_probe fetch <handle> <receipt>
         expect_contains:
-          - '\"origin\":\"restored\"'
-          - '\"birthday\":\"2021-11-14\"'
           - "databaseKey"
       - title: "Opened again, it takes that password and hands over the same key"
         run: |
