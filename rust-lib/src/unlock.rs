@@ -12,6 +12,7 @@ use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
 use rand::RngCore;
+use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use zeroize::Zeroizing;
@@ -159,23 +160,35 @@ pub struct Holder {
     pub kind: String,
 }
 
-/// What only an unlock shows, sealed under the seed key.
+/// `enroll_seed`'s params, from a signer's add flow.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EnrollParams {
+    pub seed: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub unlock_key: Option<String>,
+    pub name: String,
+    /// Older signers still send these; ignored.
+    #[serde(default, rename = "origin")]
+    _origin: IgnoredAny,
+    #[serde(default, rename = "birthday")]
+    _birthday: IgnoredAny,
+}
+
+/// What only an unlock shows, sealed under the seed key. Older builds also sealed an `origin` and a
+/// `birthday` here; they read and are dropped.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct About {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub private_name: Option<String>,
-    /// `created` when the signer made the seed, so it has no history; else `restored`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub origin: Option<String>,
-    /// The seed's first possible day, `YYYY-MM-DD`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub birthday: Option<String>,
 }
 
 impl About {
     fn is_empty(&self) -> bool {
-        self.private_name.is_none() && self.origin.is_none() && self.birthday.is_none()
+        self.private_name.is_none()
     }
 }
 
@@ -711,7 +724,7 @@ impl Unlock {
         Ok((module_key(&root, module, scope, g), g))
     }
 
-    /// The private name, origin and birthday of an unlocked seed.
+    /// The private name of an unlocked seed.
     pub fn about(&self, seed: &str) -> Result<About> {
         let rec = self.record(seed)?;
         let key = self.key_of(seed)?;
@@ -971,12 +984,7 @@ fn check_typed(typed: &str) -> Result<()> {
 }
 
 fn check_about(about: About) -> Result<About> {
-    let day = |d: &str| d.len() == 10 && d.bytes().enumerate().all(|(i, c)| if i == 4 || i == 7 { c == b'-' } else { c.is_ascii_digit() });
-    Ok(About {
-        private_name: about.private_name.map(|n| check_name(&n, "private name")).transpose()?,
-        origin: about.origin.filter(|o| o == "created" || o == "restored"),
-        birthday: about.birthday.filter(|b| day(b)),
-    })
+    Ok(About { private_name: about.private_name.map(|n| check_name(&n, "private name")).transpose()? })
 }
 
 fn scrypt_key(typed: &str, rec: &PasswordRecord) -> Result<Key> {
@@ -1244,21 +1252,62 @@ mod tests {
     }
 
     #[test]
-    fn the_private_name_and_birthday_show_only_while_unlocked() {
+    fn the_private_name_shows_only_while_unlocked() {
         let dir = Dir::new();
         let mut s = dir.store();
-        let about = About { origin: Some("created".into()), birthday: Some("2026-10-01".into()), private_name: None };
-        let seed = s.enroll(holder("keystore_module", "g_1"), Some(&u(1)), "Main", about).unwrap().seed;
+        let seed = s.enroll(holder("keystore_module", "g_1"), Some(&u(1)), "Main", About::default()).unwrap().seed;
         s.set_names(&seed, Some("Spending"), Some(Some("Grandma's savings"))).unwrap();
         let w = &s.wallets()[0];
         assert_eq!((w.name.as_str(), w.about.private_name.as_deref()), ("Spending", Some("Grandma's savings")));
-        assert_eq!(w.about.birthday.as_deref(), Some("2026-10-01"));
         s.lock(None);
         assert_eq!(s.wallets()[0].about, About::default());
         assert!(s.set_names(&seed, None, Some(Some("x"))).is_err(), "a private name needs the wallet unlocked");
         s.set_names(&seed, Some("Daily"), None).unwrap();
         let text = std::fs::read_to_string(dir.0.join("seeds.json")).unwrap();
-        assert!(text.contains("Daily") && !text.contains("Grandma") && !text.contains("2026-10-01"), "{text}");
+        assert!(text.contains("Daily") && !text.contains("Grandma"), "{text}");
+    }
+
+    #[test]
+    fn an_older_signers_origin_and_birthday_still_enroll_and_are_kept_nowhere() {
+        let dir = Dir::new();
+        let mut s = dir.store();
+        let sent = format!(
+            r#"{{"seed":"g_1","kind":"keystore","unlockKey":"{}","name":"Main","origin":"created","birthday":"2021-11-14"}}"#,
+            hex::encode(u(1))
+        );
+        let p: EnrollParams = serde_json::from_str(&sent).unwrap();
+        let key = hex::decode(p.unlock_key.unwrap()).unwrap();
+        let holder = Holder { signer: "keystore_module".into(), seed: p.seed, kind: p.kind };
+        let seed = s.enroll(holder, Some(&key), &p.name, About::default()).unwrap().seed;
+        assert!(s.record(&seed).unwrap().about.is_none(), "nothing sealed");
+        let text = std::fs::read_to_string(dir.0.join("seeds.json")).unwrap();
+        assert!(!text.contains("created") && !text.contains("2021-11-14"), "{text}");
+        let nulls = r#"{"seed":"g_2","name":"Other","origin":null,"birthday":null}"#;
+        assert!(serde_json::from_str::<EnrollParams>(nulls).is_ok());
+        assert!(serde_json::from_str::<EnrollParams>(r#"{"seed":"g_3","name":"X","day":"1"}"#).is_err());
+    }
+
+    #[test]
+    fn an_older_builds_sealed_origin_and_birthday_still_open_and_keep_the_private_name() {
+        let dir = Dir::new();
+        let mut s = dir.store();
+        let seed = s.enroll(holder("keystore_module", "g_1"), Some(&u(1)), "Main", About::default()).unwrap().seed;
+        let older = br#"{"privateName":"Grandma's savings","origin":"restored","birthday":"2021-11-14"}"#;
+        let rec = s.record(&seed).unwrap().clone();
+        let k = module_key(s.key_of(&seed).unwrap(), MANAGER, "about", rec.generation);
+        s.record_mut(&seed).unwrap().about = Some(seal(&k, older, &aad(&["about", &rec.id])));
+        s.save().unwrap();
+
+        let mut s = dir.store();
+        let way = only_way(&s, &seed);
+        s.unlock(&seed, &way, &device(1)).unwrap();
+        assert_eq!(s.about(&seed).unwrap().private_name.as_deref(), Some("Grandma's savings"));
+        // Sealed again, it keeps the private name alone.
+        s.set_names(&seed, None, Some(Some("Savings"))).unwrap();
+        let rec = s.record(&seed).unwrap();
+        let k = module_key(s.key_of(&seed).unwrap(), MANAGER, "about", rec.generation);
+        let plain = unseal(&k, rec.about.as_deref().unwrap(), &aad(&["about", &rec.id])).unwrap();
+        assert_eq!(std::str::from_utf8(&plain).unwrap(), r#"{"privateName":"Savings"}"#);
     }
 
     #[test]
