@@ -374,7 +374,8 @@ A device signer answers `sign` with a job that waits for its person. The approva
 failed. Every signature that comes back is checked against the account before a result is built.
 An answer that fails the check puts the request back on screen, saying why. The doctest drives this
 with `doctests/mock-device`, a fixture behind the same interface that waits for its button and can
-answer wrong on purpose.
+answer wrong on purpose. Its `enroll` adds its seed as a wallet, as a signer's add flow does, so an approver
+can open its accounts.
 
 The manager calls its signers from inside its own methods, so it runs with `concurrency: "multi"`:
 each call has a worker thread, and the manager's state sits behind one lock. A call that arrives

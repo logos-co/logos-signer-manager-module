@@ -2,12 +2,17 @@
 //! pressed, and it can answer wrong on purpose. Its keys come from the "abandon … about" phrase, so
 //! it stands beside a keystore holding the "test … junk" keys.
 
+use std::sync::mpsc::sync_channel;
 use std::sync::MutexGuard;
+use std::time::Duration;
 
 use logos_signer_interface::json as signer_json;
 use logos_signer_interface::mock::{Doctor, MockOptions, MockSigner};
-use logos_signer_interface::{Payload, RequestKind, Signer};
+use logos_signer_interface::{Payload, RequestKind, Signer, UnlockKeyRequest};
 use serde_json::{json, Value};
+
+/// The module behind `logos.wallets/1`, bound at runtime.
+const WALLETS: &str = "signer_manager_module";
 
 const PHRASE: &str =
     "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
@@ -37,6 +42,9 @@ pub trait MockDeviceSignerModule: Send + Sync + 'static {
     fn plug(&self, connected: bool) -> String;
     /// Take whole requests from now on, as a device with a screen does, or hashes again.
     fn whole(&self, enabled: bool) -> String;
+    /// Add the device's seed to the signer manager as wallet `name`, as a signer's add flow does:
+    /// `enroll_seed`'s reply. The manager admits it once it is a configured signer.
+    fn enroll(&self, name: String) -> String;
 
     fn on_context_ready(&self, _ctx: &RustModuleContext) {}
 }
@@ -178,6 +186,40 @@ impl MockDeviceSignerModule for MockDeviceSignerModuleImpl {
         // The manager reads a signer's info again when it says its accounts changed.
         emit_signer_accounts_changed(count as i64);
         json!({ "ok": true, "whole": enabled }).to_string()
+    }
+
+    fn enroll(&self, name: String) -> String {
+        let (seed, key) = {
+            let mut device = self.device();
+            let seed = match device.accounts() {
+                Ok(accounts) => accounts.into_iter().find_map(|a| a.seed),
+                Err(e) => return err(e),
+            };
+            let Some(seed) = seed else { return err("the device lists no seed") };
+            // The unlock key at index 0, confirmed on the device as at its add.
+            let request = UnlockKeyRequest { seed: seed.clone(), index: 0, secret: None };
+            let key = device.unlock_key(request).and_then(|job| {
+                if device.waiting_keys().contains(&job) {
+                    device.confirm(&job)?;
+                }
+                device.unlock_key_result(&job)
+            });
+            match key {
+                Ok(k) => (seed, k.key),
+                Err(e) => return err(e),
+            }
+        };
+        let body = json!({ "seed": seed, "kind": "mock_device", "unlockKey": key.expose(), "name": name });
+        let (tx, rx) = sync_channel(1);
+        let manager = wallets::WalletsClient::bind(WALLETS);
+        manager.enroll_seed_async_with_timeout(&body.to_string(), Duration::from_secs(20), move |r| {
+            let _ = tx.send(r);
+        });
+        match rx.recv_timeout(Duration::from_secs(25)) {
+            Ok(Ok(reply)) => reply,
+            Ok(Err(e)) => err(e),
+            Err(_) => err("the signer manager didn't answer"),
+        }
     }
 }
 
