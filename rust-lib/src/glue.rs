@@ -46,7 +46,8 @@ pub trait SignerManagerModule: Send + Sync + 'static {
     /// Every account once, with every signer that holds it, ranked: `{ ok, accounts: [{ key,
     /// family, chain?, address?, path?, label?, labels?, wallet?: { fingerprint?, name? }, holders:
     /// [{ signer, accountId, kind, model, transport, presence, available, collects, showsRequest,
-    /// requestKinds }] }] }`. No xpub.
+    /// requestKinds }], firstAddress? }] }`. No xpub; `firstAddress` (a Bitcoin account's 0/0, while
+    /// unlocked) to approvers only.
     fn roster(&self) -> String;
 
     // ── Tier A: the configured approver only ────────────────────────────
@@ -117,8 +118,9 @@ pub trait SignerManagerModule: Send + Sync + 'static {
     fn unattended_signatures(&self) -> String;
 
     // ── Wallets: each seed unlocked once per session, in the Signer app ─────
-    /// Every wallet: `{ ok, wallets: [{ seed, name, locked, kinds, privateName?, holderSeed?,
-    /// device?, wayIn? }] }`, the last three to its holders only. Tier B.
+    /// Every wallet: `{ ok, wallets: [{ seed, name, named, locked, kinds, privateName?, holderSeed?,
+    /// device?, wayIn? }] }`, the last three to its holders only. `named`: the person gave `name`,
+    /// so holders take it. Tier B.
     fn wallets(&self) -> String;
     /// The caller's own key for a wallet's data: `{ seed, scope, generation? }`, `seed` a wallet's
     /// or `"profile"` → `{ ok, key, generation }`, or `code: locked`. Tier B: a module gets only
@@ -129,6 +131,10 @@ pub trait SignerManagerModule: Send + Sync + 'static {
     /// or `code: invalid` with `wallet` when the key is another wallet's. `seed` in is the signer's
     /// own name for it. The configured signers only.
     fn enroll_seed(&self, params_json: String) -> String;
+    /// A holder's app renamed a wallet: `{ seed, name }`, `seed` the signer's own name for it →
+    /// `{ ok, seed, name }`. The one name every app shows; holders take it on `wallets_changed`.
+    /// The configured signers holding that seed only.
+    fn name_seed(&self, params_json: String) -> String;
     /// The Signer app's view: `{ ok, wallets: [{ seed, name, privateName?, locked, holders, device,
     /// index, generation, ways: [{ id, factors: [{ kind, id?, name? }] }], alwaysUnlocked }],
     /// passwords: [{ id, name, wallets }] }`. `device`: its holders give an unlock key, so a way
@@ -1088,6 +1094,7 @@ impl Core {
             return not_authorized();
         }
         self.refresh();
+        let approver = self.is_approver();
         let roster = self.signers.roster();
         let snapshots = self.origins.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let store = &self.wallets.store;
@@ -1096,6 +1103,9 @@ impl Core {
             .map(|(key, holders)| {
                 let mut e = crate::roster::entry_json(key, holders, |f| crate::origins::of(&snapshots, &f.name, &f.account));
                 e["seed"] = holders.iter().find_map(|f| store.seed_of(&f.name, f.account.seed.as_deref()?)).into();
+                if let Some(a) = approver.then(|| crate::roster::first_address(holders)).flatten() {
+                    e["firstAddress"] = a.into();
+                }
                 e
             })
             .collect();
@@ -1176,6 +1186,30 @@ impl Core {
                 json!({ "ok": true, "seed": e.seed, "new": e.new, "unlocked": e.unlocked, "device": e.device,
                         "wayIn": e.way_in })
                 .to_string()
+            }
+            Err(e) => manager_err(&e),
+        }
+    }
+
+    fn name_seed(&mut self, params_json: String) -> String {
+        let Some(signer) = self.is_signer() else {
+            return not_authorized();
+        };
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            seed: String,
+            name: String,
+        }
+        let w: Wire = match serde_json::from_str(&params_json) {
+            Ok(w) => w,
+            Err(e) => return err(format!("name_seed: {e}")),
+        };
+        match self.wallets.store.name_seed(&signer, &w.seed, &w.name) {
+            Ok((seed, name)) => {
+                self.wallets.note(&seed);
+                self.announce_wallets();
+                json!({ "ok": true, "seed": seed, "name": name }).to_string()
             }
             Err(e) => manager_err(&e),
         }
@@ -1608,6 +1642,10 @@ impl SignerManagerModule for SignerManagerModuleImpl {
 
     fn enroll_seed(&self, params_json: String) -> String {
         self.core().enroll_seed(params_json)
+    }
+
+    fn name_seed(&self, params_json: String) -> String {
+        self.core().name_seed(params_json)
     }
 
     fn wallet_settings(&self) -> String {

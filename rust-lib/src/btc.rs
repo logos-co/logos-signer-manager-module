@@ -193,6 +193,16 @@ impl AccountPublic {
         })
     }
 
+    /// The address at 0/0, which every app shows for the account. Test chains use testnet's `tb1`.
+    pub fn first_address<C: Verification>(&self, secp: &Secp256k1<C>) -> Result<String> {
+        let net = match self.chain {
+            Chain::Main => Network::Bitcoin,
+            Chain::Test => Network::Testnet,
+        };
+        let script = self.script_at(secp, 0, 0)?;
+        bitcoin::Address::from_script(&script, net).map(|a| a.to_string()).map_err(|e| bad(format!("address: {e}")))
+    }
+
     /// `<change>/<index>` when `path` is this account's origin followed by those two levels, unhardened.
     pub fn relative(&self, path: &DerivationPath) -> Option<(u32, u32)> {
         let origin = self.origin();
@@ -347,6 +357,20 @@ pub(crate) mod tests {
             let script = public.script_at(&secp, change, index).unwrap();
             assert_eq!(Address::from_script(&script, Network::Bitcoin).unwrap().to_string(), address);
         }
+    }
+
+    #[test]
+    fn the_first_address_is_0_0_on_the_accounts_chain() {
+        let secp = Secp256k1::verification_only();
+        assert_eq!(account(Family::Segwit).first_address(&secp).unwrap(), "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu");
+        assert_eq!(
+            account(Family::Taproot).first_address(&secp).unwrap(),
+            "bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr"
+        );
+        let test = AccountPublic { chain: Chain::Test, ..account(Family::Segwit) };
+        // The same witness program, under testnet's prefix and so another checksum.
+        let a = test.first_address(&secp).unwrap();
+        assert!(a.starts_with("tb1qcr8te4kr609gcawutmrza0j4xv80jy8z") && a.len() == 42, "{a}");
     }
 
     #[test]

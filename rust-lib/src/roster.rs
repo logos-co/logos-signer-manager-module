@@ -144,6 +144,13 @@ pub fn entry_json(key: &str, holders: &[Found], origin_of: impl Fn(&Found) -> Op
     })
 }
 
+/// A Bitcoin account's first receiving address, from any holder's xpub. Approvers only: with the
+/// account's path it ties the account to its history.
+pub fn first_address(holders: &[Found]) -> Option<String> {
+    let secp = bitcoin::secp256k1::Secp256k1::verification_only();
+    holders.iter().find_map(|f| crate::btc::AccountPublic::from_account(&f.account).ok()?.first_address(&secp).ok())
+}
+
 /// A holder as apps see it: public, and no xpub.
 pub fn holder_json(f: &Found) -> serde_json::Value {
     serde_json::json!({
@@ -248,6 +255,19 @@ mod tests {
         let holders = vec![found(1, "b", "mock", second), found(0, "a", "mock", first)];
         assert_eq!(names(&holders), (Some("Savings".into()), vec!["Savings".into(), "Cold".into()]));
         assert_eq!(names(&holders[..1]), (Some("Cold".into()), vec![]));
+    }
+
+    #[test]
+    fn a_bitcoin_account_gets_its_first_address_from_any_holders_xpub() {
+        let (_, a, acct) = crate::psbt::tests::ours(crate::btc::Family::Segwit);
+        let mut bare = a.clone();
+        bare.xpub = None;
+        let want = acct.first_address(&bitcoin::secp256k1::Secp256k1::verification_only()).unwrap();
+        assert!(want.starts_with("tb1q"));
+        let holders = vec![found(0, "keycard_module", "keycard", bare.clone()), found(1, "keystore_module", "keystore", a)];
+        assert_eq!(first_address(&holders), Some(want));
+        assert_eq!(first_address(&holders[..1]), None, "no xpub while locked, so no address");
+        assert_eq!(first_address(&[found(0, "a", "mock", evm("0xa", true))]), None);
     }
 
     #[test]

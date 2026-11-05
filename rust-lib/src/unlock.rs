@@ -206,6 +206,9 @@ struct Way {
 struct SeedRecord {
     id: String,
     name: String,
+    /// The person gave `name`, here or in a holder's app: holders take it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    named: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     about: Option<String>,
     holders: Vec<Holder>,
@@ -278,6 +281,7 @@ pub struct Secrets {
 pub struct WalletView {
     pub seed: String,
     pub name: String,
+    pub named: bool,
     pub locked: bool,
     pub holders: Vec<Holder>,
     /// Its holders give an unlock key: a way in may take the device.
@@ -295,7 +299,8 @@ impl WalletView {
     pub fn listed(&self, caller: &str) -> serde_json::Value {
         let mut kinds: Vec<String> = self.holders.iter().map(|h| h.kind.clone()).collect();
         kinds.dedup();
-        let mut v = serde_json::json!({ "seed": self.seed, "name": self.name, "locked": self.locked,
+        let mut v = serde_json::json!({ "seed": self.seed, "name": self.name, "named": self.named,
+                                        "locked": self.locked,
                                         "kinds": kinds, "privateName": self.about.private_name });
         if let Some(h) = self.holders.iter().find(|h| h.signer == caller) {
             v["holderSeed"] = h.seed.clone().into();
@@ -608,6 +613,7 @@ impl Unlock {
         let mut rec = SeedRecord {
             id: id.clone(),
             name,
+            named: false,
             about: None,
             holders: vec![holder],
             index: 0,
@@ -747,6 +753,7 @@ impl Unlock {
             .map(|s| WalletView {
                 seed: s.id.clone(),
                 name: s.name.clone(),
+                named: s.named,
                 locked: !self.open.contains_key(&s.id),
                 holders: s.holders.clone(),
                 device: s.identity.is_some(),
@@ -865,7 +872,12 @@ impl Unlock {
     pub fn set_names(&mut self, seed: &str, name: Option<&str>, private_name: Option<Option<&str>>) -> Result<()> {
         let mut rec = self.record(seed)?.clone();
         if let Some(n) = name {
-            rec.name = check_name(n, "name")?;
+            // Saving the other name alone resends this one: only a new one counts as given.
+            let n = check_name(n, "name")?;
+            if n != rec.name {
+                rec.name = n;
+                rec.named = true;
+            }
         }
         if let Some(private) = private_name {
             let key = self.key_of(seed)?.clone();
@@ -878,6 +890,20 @@ impl Unlock {
         }
         *self.record_mut(seed)? = rec;
         self.save()
+    }
+
+    /// A holder renamed its seed in its own app: `(the manager's seed, the name)`.
+    pub fn name_seed(&mut self, signer: &str, holder_seed: &str, name: &str) -> Result<(String, String)> {
+        self.usable()?;
+        let name = check_name(name, "name")?;
+        let seed = self
+            .seed_of(signer, holder_seed.trim())
+            .ok_or_else(|| ManagerError::NotFound(format!("{signer} holds no wallet {}", holder_seed.trim())))?;
+        let rec = self.record_mut(&seed)?;
+        rec.name = name.clone();
+        rec.named = true;
+        self.save()?;
+        Ok((seed, name))
     }
 
     pub fn create_password(&mut self, name: &str, typed: &str) -> Result<String> {
@@ -1265,6 +1291,29 @@ mod tests {
         s.set_names(&seed, Some("Daily"), None).unwrap();
         let text = std::fs::read_to_string(dir.0.join("seeds.json")).unwrap();
         assert!(text.contains("Daily") && !text.contains("Grandma"), "{text}");
+    }
+
+    #[test]
+    fn a_name_given_anywhere_marks_the_wallet_named_for_every_holder() {
+        let dir = Dir::new();
+        let mut s = dir.store();
+        let seed = s.enroll(holder("keycard_module", "uid"), Some(&u(1)), "Keycard 02246c2a", About::default()).unwrap().seed;
+        s.enroll(holder("keystore_module", "g_1"), Some(&u(1)), "Keystore wallet", About::default()).unwrap();
+        assert!(!s.wallets()[0].named, "an enrolled default is no one's choice");
+        // Saving the private name alone resends the same public name.
+        s.set_names(&seed, Some("Keycard 02246c2a"), Some(Some("Mine"))).unwrap();
+        assert!(!s.wallets()[0].named);
+        assert!(s.name_seed("keystore_module", "uid", "x").is_err(), "named by another holder's id");
+        assert!(s.name_seed("qr_signer_module", "uid", "x").is_err(), "a signer that doesn't hold it");
+        assert!(s.name_seed("keycard_module", "uid", "  ").is_err());
+        assert_eq!(s.name_seed("keycard_module", " uid ", " White Card #1 ").unwrap(), (seed.clone(), "White Card #1".into()));
+        let listed = s.wallets()[0].listed("keystore_module");
+        assert_eq!((listed["name"].as_str(), listed["named"].as_bool()), (Some("White Card #1"), Some(true)));
+        drop(s);
+        let mut s = dir.store();
+        assert!(s.wallets()[0].named, "kept across restarts");
+        s.set_names(&seed, Some("Cold"), None).unwrap();
+        assert_eq!(s.wallets()[0].name, "Cold");
     }
 
     #[test]

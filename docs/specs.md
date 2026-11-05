@@ -58,7 +58,7 @@ stays in `signing`, and each later call checks how the job stands:
 | C | `accounts`, `signers`, `caller_identity`, and for now `configure` | anyone |
 | B | `request_open`, `request_unlock` | any **named module**, collecting with `fetch_result` and its receipt |
 | B | `wallets`, `data_key` | any **named module**; `data_key` answers the caller's own keys only |
-| — | `enroll_seed` | a configured **signer** module |
+| — | `enroll_seed`, `name_seed` | a configured **signer** module; `name_seed` only for a seed it holds |
 | A | `wallet_settings`, `unlock_wallet`, `unlock_progress`, `cancel_unlock`, `lock_wallets`, `set_rule`, `change_keys`, `set_names`, `create_password`, `rename_password`, `change_password`, `remove_password` | a configured **approver** |
 | A and D | `access_requests`, `acknowledge_access`, `approve_access`, `reject_access` | an approver for opens (its consent), or the custodian |
 | D | `open_accounts`, `unlock`, `lock` | a configured **custodian** (default `evm_keystore_ui`, the keys app) |
@@ -106,7 +106,7 @@ refuse or stall a request, but it can't get a false signature past the checks ab
 | `approve` | `handle, bundle_id, password` | `{ ok, signed_count }`, or `{ ok, state: "signing" }`, or `{ ok: false, code, error }` |
 | `reject` | `handle` | `bool` |
 | `accounts` | — | `{ ok, accounts: [{ id, key, family, chain?, address?, label?, signer, available }] }`, each under one holder |
-| `roster` | — | `{ ok, accounts: [{ key, family, chain?, address?, path?, label?, labels?, wallet?, holders }] }`, each with every holder |
+| `roster` | — | `{ ok, accounts: [{ key, family, chain?, address?, path?, label?, labels?, wallet?, holders, firstAddress? }] }`, each with every holder; `firstAddress` to approvers only |
 | `signers` | — | `{ ok, signers: [{ name, info? }] }` |
 | `caller_identity` | — | `{ ok, kind, identity, approvers, custodians, signers }`: everything a total `configure` must repeat |
 | `request_open`, `request_unlock` | `params_json` | `{ ok, handle, receipt, state }` |
@@ -121,9 +121,10 @@ refuse or stall a request, but it can't get a false signature past the checks ab
 | `lock` | `params_json` | `{ ok, locked }` |
 | `unlocked` | — | `{ ok, unlocked: [{ account, expiresInMs, countLeft, apps, confirm }] }` |
 | `unattended_signatures` | — | `{ ok, signed: [{ handle, requester, account, ageMs }] }` |
-| `wallets` | — | `{ ok, wallets: [{ seed, name, locked, kinds, privateName?, holderSeed?, device?, wayIn? }] }`; the last three only to a holder of that wallet |
+| `wallets` | — | `{ ok, wallets: [{ seed, name, named, locked, kinds, privateName?, holderSeed?, device?, wayIn? }] }`; the last three only to a holder of that wallet |
 | `data_key` | `params_json` | `{ ok, key, generation, seed }`, or `{ ok: false, code: "locked" }` |
 | `enroll_seed` | `params_json` | `{ ok, seed, new, unlocked, device, wayIn }`, or `{ ok: false, code: "invalid", error, wallet }` |
+| `name_seed` | `params_json` | `{ ok, seed, name }` |
 | `wallet_settings` | — | `{ ok, wallets: [{ seed, name, privateName?, locked, holders, device, index, generation, ways }], passwords: [{ id, name, wallets }] }`; `device`: its holders give an unlock key |
 | `unlock_wallet`, `set_rule`, `change_keys` | `params_json` | `{ ok, state: "done" }`, or `{ ok, state: "device", handle }`, or `{ ok: false, code, error }` |
 | `unlock_progress` | `handle` | `{ ok, state, seed, step?, code?, error? }` |
@@ -136,7 +137,9 @@ refuse or stall a request, but it can't get a false signature past the checks ab
 unlock), `unavailable` (the signer module didn't answer, or the chosen device isn't connected). The
 manager adds its own `signer_changed`: see below. The request stays on screen for all of them.
 `accounts` and `roster` carry no xpub: a Bitcoin wallet's xpub shows its whole history, so the
-manager does not hand it to whoever asks.
+manager does not hand it to whoever asks. To an approver only, `roster` adds a Bitcoin account's
+`firstAddress`, its receiving address at 0/0 (`tb1…` on the test chains), while a holder lists its
+xpub, that is while its wallet is unlocked: every app shows an account by it.
 
 ## One account, several signers
 
@@ -254,7 +257,13 @@ restart or a `lock_wallets`.
   under its scrypt output (N = 2^17, r = 8, p = 1), so `change_password` touches no wallet, and
   `remove_password` is refused while a rule takes it. Their names show in the clear.
 - **Names.** A wallet's public `name` shows while it is locked; its private name is sealed under
-  its seed key and shows once it is unlocked.
+  its seed key and shows once it is unlocked. The public name is the one every app shows:
+  - `set_names` (the Signer app) and `name_seed({ seed, name })` (a holder's app, `seed` its own
+    name for it) set it and mark the wallet `named`; `wallets_changed` follows. Saving the private
+    name alone, which resends the same public one, marks nothing.
+  - Holders read `wallets()` on `wallets_changed` and take the `name` of each wallet they hold that
+    is `named`. One not `named` keeps the name its first holder enrolled it with, until a holder
+    with a name the person gave sends it once.
 - **Adding.** A signer calls `enroll_seed` from its add flow, while the holder's unlock key at
   index 0 is at hand, so adding never asks twice: `{ seed, kind, unlockKey?, name }`, where `seed`
   is the signer's own name for the seed (a Keycard's key UID, a Shell's master key id, a QR
@@ -276,8 +285,8 @@ restart or a `lock_wallets`.
 - **Files.** `<persistence>/unlock/seeds.json` and `passwords.json`, the directory 0700 and the
   files 0600, written atomically. They hold no key in the clear. Files the manager can't read are
   left alone, and every call answers why.
-- `data_key` and `enroll_seed` answer a module that may be waiting on its own call, so they call
-  out to no module.
+- `data_key`, `enroll_seed` and `name_seed` answer a module that may be waiting on its own call,
+  so they call out to no module.
 
 ## Opening and unlocking
 
