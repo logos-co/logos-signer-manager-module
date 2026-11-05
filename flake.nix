@@ -10,7 +10,7 @@
     };
     # The first signer: the key files. A dependency, so it loads with the manager.
     keystore_module = {
-      url = "github:logos-co/logos-evm-keystore-module/c68b7b4d933f30f87e033e6a1d7865f298e4d858";
+      url = "github:logos-co/logos-evm-keystore-module/e83a899a1718ed52e3173dc85d06b15b9c68f41a";
       inputs.logos-module-builder.follows = "logos-module-builder";
     };
     # The Keycard signers: optional, so they load with the manager only where installed.

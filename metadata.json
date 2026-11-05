@@ -1,6 +1,6 @@
 {
   "name": "signer_manager_module",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Signer manager: takes signature requests, shows them through the signer app, and has each account's signer sign. Holds no keys.",
   "author": "Logos Core Team",
   "type": "core",
@@ -8,8 +8,14 @@
   "concurrency": "multi",
   "category": "wallet",
   "main": "signer_manager_module_plugin",
-  "dependencies": ["keystore_module"],
-  "optional_dependencies": ["keycard_module", "keycard_shell_module", "qr_signer_module"],
+  "dependencies": [
+    { "name": "keystore_module", "version": "~0.2.0" }
+  ],
+  "optional_dependencies": [
+    { "name": "keycard_module", "version": "~0.2.0" },
+    { "name": "keycard_shell_module", "version": "~0.2.0" },
+    { "name": "qr_signer_module", "version": "~0.2.0" }
+  ],
   "interface_dependencies": [
     { "name": "signer", "input": "logos-signer-interface", "file": "signer.lidl" }
   ],

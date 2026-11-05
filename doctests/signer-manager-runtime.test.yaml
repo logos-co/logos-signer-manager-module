@@ -45,9 +45,9 @@ sections:
     steps:
       - title: "Build the keystore, the manager and the probe"
         run: |
-          nix build 'github:logos-co/logos-evm-keystore-module/c68b7b4d933f30f87e033e6a1d7865f298e4d858#lgx' --no-write-lock-file -o keystore-lgx
+          nix build 'github:logos-co/logos-evm-keystore-module/e83a899a1718ed52e3173dc85d06b15b9c68f41a#lgx' --no-write-lock-file -o keystore-lgx
           nix build 'github:logos-co/logos-signer-manager-module{release}#lgx' --no-write-lock-file -o manager-lgx
-          nix build 'github:logos-co/logos-signer-manager-module{release}?dir=doctests/manager-probe#lgx' --override-input signer_manager_module 'github:logos-co/logos-signer-manager-module{release}' --override-input keystore_module 'github:logos-co/logos-evm-keystore-module/c68b7b4d933f30f87e033e6a1d7865f298e4d858' --no-write-lock-file -o probe-lgx
+          nix build 'github:logos-co/logos-signer-manager-module{release}?dir=doctests/manager-probe#lgx' --override-input signer_manager_module 'github:logos-co/logos-signer-manager-module{release}' --override-input keystore_module 'github:logos-co/logos-evm-keystore-module/e83a899a1718ed52e3173dc85d06b15b9c68f41a' --no-write-lock-file -o probe-lgx
           nix build 'github:logos-co/logos-signer-manager-module{release}?dir=doctests/mock-device#lgx' --no-write-lock-file -o device-lgx
           ls keystore-lgx/*.lgx manager-lgx/*.lgx probe-lgx/*.lgx device-lgx/*.lgx
         code_block: |
