@@ -94,16 +94,14 @@ sections:
           - '{"module":"keycard_shell_module","named_by":"signer_manager_module","reason":"not_installed"}'
       - title: "Unconfigured, the keystore and the device modules"
         text: |
-          With nothing configured, the manager consults the keystore, then the Keycard Shell's, the
-          bare Keycard's and the QR signer's modules. No device module is installed here, so each
-          offers nothing.
+          With nothing configured, the manager consults the keystore, then the Keycard Shell's and the
+          bare Keycard's modules. No device module is installed here, so each offers nothing.
         run: "./logos/bin/logosctl --config-dir ./session call signer_manager_module signers"
         code_block: "logosctl call signer_manager_module signers"
         expect_contains:
           - '\"kind\":\"keystore\"'
           - '\"info\":null,\"name\":\"keycard_shell_module\"'
           - '\"info\":null,\"name\":\"keycard_module\"'
-          - '\"info\":null,\"name\":\"qr_signer_module\"'
       - title: "Name the roles"
         text: |
           The keystore's custodian administers its key files, and only its manager may ask it to sign.

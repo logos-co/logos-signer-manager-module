@@ -7,7 +7,7 @@ pub const DEFAULT_APPROVER: &str = "evm_signer_ui";
 pub const DEFAULT_CUSTODIAN: &str = "evm_keystore_ui";
 /// The signer modules consulted, in order, when nothing configures them. A device module that
 /// isn't installed offers nothing (`registry.rs`).
-pub const DEFAULT_SIGNERS: &[&str] = &["keystore_module", "keycard_shell_module", "keycard_module", "qr_signer_module"];
+pub const DEFAULT_SIGNERS: &[&str] = &["keystore_module", "keycard_shell_module", "keycard_module"];
 
 /// Who holds each role, and which signer modules are consulted. A role is a set: a terminal
 /// approver works beside the app rather than displacing it.
@@ -135,7 +135,7 @@ mod tests {
     fn the_keystore_comes_first_then_the_device_modules() {
         assert_eq!(
             Roles::default().signers,
-            vec!["keystore_module", "keycard_shell_module", "keycard_module", "qr_signer_module"]
+            vec!["keystore_module", "keycard_shell_module", "keycard_module"]
         );
     }
 
