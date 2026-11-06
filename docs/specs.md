@@ -75,10 +75,11 @@ keystore's: a role or list the document doesn't name is held by nobody, and a ma
 changes nothing. `signers` lists the signer modules consulted, in order; when several hold the same
 account, that order breaks ties between them (see
 [One account, several signers](#one-account-several-signers)). Defaults: approver `evm_signer_ui`, custodian `evm_keystore_ui`
-(for the open and unlock requests to come), signers `keystore_module`, `keycard_shell_module`,
-`keycard_module` and `qr_signer_module`, so a device module the person installs is consulted with
-nothing to configure. The QR signer comes last, and needs no connection: a Keycard Shell's account
-it shares with the Shell's USB module is signed over USB by default while the Shell is connected.
+(for the open and unlock requests to come), signers `keystore_module`, `keycard_shell_module` and
+`keycard_module`, so a device module the person installs is consulted with nothing to configure.
+`qr_signer_module` is not a default while the QR signer is unreleased; configured, it comes last,
+and needs no connection: a Keycard Shell's account it shares with the Shell's USB module is signed
+over USB by default while the Shell is connected.
 A signer that doesn't answer, such as a device module that isn't installed, offers nothing and
 rests for 30 seconds. Each ask costs the transport about a second to find no module, and longer on
 a loaded machine, so a resting signer isn't asked again before then, unless it announces itself
@@ -367,9 +368,10 @@ that only listens hears it without anyone calling the manager first.
 
 Signer modules are bound at runtime through the `signer` interface dependency
 (`signer.lidl`, from `logos-signer-interface`), one binding per configured name. `keystore_module`
-is also a concrete dependency, so it loads with the manager. `keycard_module`,
-`keycard_shell_module` and `qr_signer_module` are optional dependencies: where installed, they load
-with the manager and ahead of it, and where not, the manager loads without them. A signer that doesn't answer within
+is also a concrete dependency, so it loads with the manager. `keycard_module` and
+`keycard_shell_module` are optional dependencies: where installed, they load with the manager and
+ahead of it, and where not, the manager loads without them. `qr_signer_module` is neither a
+dependency nor a default signer while it is unreleased. A signer that doesn't answer within
 three seconds for `signer_info`, or twenty for anything else, offers nothing until asked again.
 
 A signer that shows requests on its own screen takes them whole, one per request:

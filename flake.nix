@@ -23,11 +23,6 @@
       url = "github:logos-co/logos-keycard-shell-module";
       inputs.logos-module-builder.follows = "logos-module-builder";
     };
-    # The QR signer, optional too.
-    qr_signer_module = {
-      url = "github:logos-co/logos-qr-signer-module";
-      inputs.logos-module-builder.follows = "logos-module-builder";
-    };
   };
 
   outputs = inputs@{ self, logos-module-builder, ... }:
