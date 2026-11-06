@@ -21,7 +21,8 @@ account once with every signer that holds it, ranked: the keystore, connected de
 then unplugged devices. Apps pick accounts from it. `signers` says which signer modules are
 consulted. `configure` names the approvers, the custodians and the signers. Unconfigured, it consults
 the keystore, then the Keycard Shell's, the Keycard's and the QR signer's modules when they are
-installed. Those three are optional dependencies, so installed ones load with the manager.
+installed. The two Keycard modules are optional dependencies, so installed ones load with the
+manager. The QR signer is not one while it is unreleased, so nothing loads it with the manager.
 
 Each wallet, a seed whichever signers hold it, is unlocked once per session in the Signer app, by
 its device, a password, or both, as its rule says. The manager then hands each module keys of its

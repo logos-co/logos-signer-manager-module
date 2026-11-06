@@ -83,9 +83,8 @@ sections:
           - "mock_device_signer"
       - title: "Load the probe, which loads the manager and the keystore"
         text: |
-          The Keycard and QR signer modules are the manager's optional dependencies: installed ones
-          load with it. None is installed here, so the load reports each as skipped and succeeds
-          without them.
+          The Keycard modules are the manager's optional dependencies: installed ones load with it.
+          Neither is installed here, so the load reports each as skipped and succeeds without them.
         run: "./logos/bin/logosctl --config-dir ./session module load manager_probe"
         code_block: "logosctl module load manager_probe"
         expect_contains:
@@ -93,7 +92,6 @@ sections:
           - "keystore_module"
           - '{"module":"keycard_module","named_by":"signer_manager_module","reason":"not_installed"}'
           - '{"module":"keycard_shell_module","named_by":"signer_manager_module","reason":"not_installed"}'
-          - '{"module":"qr_signer_module","named_by":"signer_manager_module","reason":"not_installed"}'
       - title: "Unconfigured, the keystore and the device modules"
         text: |
           With nothing configured, the manager consults the keystore, then the Keycard Shell's, the

@@ -367,9 +367,10 @@ that only listens hears it without anyone calling the manager first.
 
 Signer modules are bound at runtime through the `signer` interface dependency
 (`signer.lidl`, from `logos-signer-interface`), one binding per configured name. `keystore_module`
-is also a concrete dependency, so it loads with the manager. `keycard_module`,
-`keycard_shell_module` and `qr_signer_module` are optional dependencies: where installed, they load
-with the manager and ahead of it, and where not, the manager loads without them. A signer that doesn't answer within
+is also a concrete dependency, so it loads with the manager. `keycard_module` and
+`keycard_shell_module` are optional dependencies: where installed, they load with the manager and
+ahead of it, and where not, the manager loads without them. `qr_signer_module` is not one while it
+is unreleased, so nothing loads it with the manager. A signer that doesn't answer within
 three seconds for `signer_info`, or twenty for anything else, offers nothing until asked again.
 
 A signer that shows requests on its own screen takes them whole, one per request:
