@@ -58,7 +58,7 @@ stays in `signing`, and each later call checks how the job stands:
 | C | `accounts`, `signers`, `caller_identity`, and for now `configure` | anyone |
 | B | `request_open`, `request_unlock` | any **named module**, collecting with `fetch_result` and its receipt |
 | B | `wallets`, `data_key` | any **named module**; `data_key` answers the caller's own keys only |
-| — | `enroll_seed`, `name_seed` | a configured **signer** module; `name_seed` only for a seed it holds |
+| — | `enroll_seed`, `name_seed`, `forget_seed` | a configured **signer** module; `name_seed` and `forget_seed` only for a seed it holds |
 | A | `wallet_settings`, `unlock_wallet`, `unlock_progress`, `cancel_unlock`, `lock_wallets`, `set_rule`, `change_keys`, `set_names`, `create_password`, `rename_password`, `change_password`, `remove_password` | a configured **approver** |
 | A and D | `access_requests`, `acknowledge_access`, `approve_access`, `reject_access` | an approver for opens (its consent), or the custodian |
 | D | `open_accounts`, `unlock`, `lock` | a configured **custodian** (default `evm_keystore_ui`, the keys app) |
@@ -126,6 +126,7 @@ refuse or stall a request, but it can't get a false signature past the checks ab
 | `data_key` | `params_json` | `{ ok, key, generation, seed }`, or `{ ok: false, code: "locked" }` |
 | `enroll_seed` | `params_json` | `{ ok, seed, new, unlocked, device, wayIn }`, or `{ ok: false, code: "invalid", error, wallet }` |
 | `name_seed` | `params_json` | `{ ok, seed, name }` |
+| `forget_seed` | `params_json` | `{ ok, seed, removed }` |
 | `wallet_settings` | — | `{ ok, wallets: [{ seed, name, privateName?, locked, holders, device, index, generation, ways }], passwords: [{ id, name, wallets }] }`; `device`: its holders give an unlock key |
 | `unlock_wallet`, `set_rule`, `change_keys` | `params_json` | `{ ok, state: "done" }`, or `{ ok, state: "device", handle }`, or `{ ok: false, code, error }` |
 | `unlock_progress` | `handle` | `{ ok, state, seed, step?, code?, error? }` |
@@ -276,6 +277,12 @@ restart or a `lock_wallets`.
   refused with `code: "invalid"` and that wallet's name in `wallet`, and nothing changes.
   `device` says its unlock key is known, `wayIn` that it can be unlocked after a lock.
   Signers list a wallet's accounts, xpubs included, only while it is unlocked.
+- **Removing.** A holder that removes a wallet in its own app calls `forget_seed({ seed })`, `seed`
+  its own name for it. The wallet drops that holder, and goes with its last: its record, its ways
+  in and its key, so every module's data under its keys can't be opened again. `removed` says it
+  went, and `wallets_changed` follows. The profile key stays open while another wallet is; with
+  none left, until this run ends, so a wallet added next takes it. A holder that finds `wallets()`
+  still listing a seed it no longer has forgets it too.
 - **Unlocking.** The Signer app calls `unlock_wallet({ seed, way, holder?, secret?, passwords? })`.
   A way without the device settles at once. One with it asks the holder for the unlock key: a PIN
   session, a press on the Shell or a QR round trip. The reply is then `{ state: "device", handle }`,
@@ -286,7 +293,7 @@ restart or a `lock_wallets`.
 - **Files.** `<persistence>/unlock/seeds.json` and `passwords.json`, the directory 0700 and the
   files 0600, written atomically. They hold no key in the clear. Files the manager can't read are
   left alone, and every call answers why.
-- `data_key`, `enroll_seed` and `name_seed` answer a module that may be waiting on its own call,
+- `data_key`, `enroll_seed`, `name_seed` and `forget_seed` answer a module that may be waiting on its own call,
   so they call out to no module.
 
 ## Opening and unlocking
