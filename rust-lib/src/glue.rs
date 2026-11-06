@@ -135,6 +135,10 @@ pub trait SignerManagerModule: Send + Sync + 'static {
     /// `{ ok, seed, name }`. The one name every app shows; holders take it on `wallets_changed`.
     /// The configured signers holding that seed only.
     fn name_seed(&self, params_json: String) -> String;
+    /// A holder removed a wallet in its own app: `{ seed }`, the signer's own name for it →
+    /// `{ ok, seed, removed }`. The wallet goes with its last holder. The configured signers
+    /// holding that seed only.
+    fn forget_seed(&self, params_json: String) -> String;
     /// The Signer app's view: `{ ok, wallets: [{ seed, name, privateName?, locked, holders, device,
     /// index, generation, ways: [{ id, factors: [{ kind, id?, name? }] }], alwaysUnlocked }],
     /// passwords: [{ id, name, wallets }] }`. `device`: its holders give an unlock key, so a way
@@ -1215,6 +1219,29 @@ impl Core {
         }
     }
 
+    fn forget_seed(&mut self, params_json: String) -> String {
+        let Some(signer) = self.is_signer() else {
+            return not_authorized();
+        };
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            seed: String,
+        }
+        let w: Wire = match serde_json::from_str(&params_json) {
+            Ok(w) => w,
+            Err(e) => return err(format!("forget_seed: {e}")),
+        };
+        match self.wallets.store.forget_seed(&signer, &w.seed) {
+            Ok((seed, removed)) => {
+                self.wallets.note(&seed);
+                self.announce_wallets();
+                json!({ "ok": true, "seed": seed, "removed": removed }).to_string()
+            }
+            Err(e) => manager_err(&e),
+        }
+    }
+
     fn wallets(&mut self) -> String {
         let Some(caller) = self.named_caller() else {
             return not_authorized();
@@ -1646,6 +1673,10 @@ impl SignerManagerModule for SignerManagerModuleImpl {
 
     fn name_seed(&self, params_json: String) -> String {
         self.core().name_seed(params_json)
+    }
+
+    fn forget_seed(&self, params_json: String) -> String {
+        self.core().forget_seed(params_json)
     }
 
     fn wallet_settings(&self) -> String {

@@ -906,6 +906,30 @@ impl Unlock {
         Ok((seed, name))
     }
 
+    /// A holder removed its seed in its own app: `(the manager's seed, whether the wallet went)`.
+    /// The wallet goes with its last holder: its record, ways in and key.
+    pub fn forget_seed(&mut self, signer: &str, holder_seed: &str) -> Result<(String, bool)> {
+        self.usable()?;
+        let holder_seed = holder_seed.trim();
+        let seed = self
+            .seed_of(signer, holder_seed)
+            .ok_or_else(|| ManagerError::NotFound(format!("{signer} holds no wallet {holder_seed}")))?;
+        let rec = self.record_mut(&seed)?;
+        rec.holders.retain(|h| h.signer != signer || h.seed != holder_seed);
+        let removed = rec.holders.is_empty();
+        if removed {
+            self.seeds.retain(|s| s.id != seed);
+            self.open.remove(&seed);
+            // As a lock does, while a locked wallet can open the profile again; with none left it
+            // stays for this run, so a wallet added next takes it.
+            if self.open.is_empty() && !self.seeds.is_empty() {
+                self.profile = None;
+            }
+        }
+        self.save()?;
+        Ok((seed, removed))
+    }
+
     pub fn create_password(&mut self, name: &str, typed: &str) -> Result<String> {
         self.usable()?;
         let name = check_name(name, "password name")?;
@@ -1314,6 +1338,36 @@ mod tests {
         assert!(s.wallets()[0].named, "kept across restarts");
         s.set_names(&seed, Some("Cold"), None).unwrap();
         assert_eq!(s.wallets()[0].name, "Cold");
+    }
+
+    #[test]
+    fn a_wallet_goes_with_its_last_holder_and_only_a_holder_forgets_it() {
+        let dir = Dir::new();
+        let mut s = dir.store();
+        let shared = s.enroll(holder("keycard_module", "uid"), Some(&u(1)), "Card", About::default()).unwrap().seed;
+        s.enroll(holder("keystore_module", "g_1"), Some(&u(1)), "Keystore wallet", About::default()).unwrap();
+        let other = s.enroll(holder("keystore_module", "g_2"), Some(&u(2)), "Other", About::default()).unwrap().seed;
+        assert!(s.forget_seed("keystore_module", "uid").is_err(), "named by another holder's id");
+        assert!(s.forget_seed("qr_signer_module", "uid").is_err(), "a signer that doesn't hold it");
+        assert_eq!(s.forget_seed("keycard_module", " uid ").unwrap(), (shared.clone(), false));
+        let holders = s.holders(&shared).unwrap();
+        assert_eq!(holders.len(), 1);
+        assert_eq!(holders[0].signer, "keystore_module");
+        assert!(s.is_unlocked(&shared), "the holder left keeps it open");
+        assert_eq!(s.forget_seed("keystore_module", "g_1").unwrap(), (shared.clone(), true));
+        assert!(s.record(&shared).is_err() && !s.is_unlocked(&shared));
+        assert!(s.data_key("core", &shared, "x", None).is_err());
+        assert!(s.forget_seed("keystore_module", "g_1").is_err(), "already gone");
+        assert!(s.data_key("core", PROFILE, "contacts", None).is_ok(), "the other wallet still opens it");
+        drop(s);
+        let mut s = dir.store();
+        assert_eq!(s.wallets().iter().map(|w| w.seed.clone()).collect::<Vec<_>>(), vec![other.clone()]);
+        // The last wallet going leaves the profile open for this run only.
+        let way = s.wallets()[0].ways[0].0.clone();
+        s.unlock(&other, &way, &device(2)).unwrap();
+        assert_eq!(s.forget_seed("keystore_module", "g_2").unwrap(), (other, true));
+        assert!(s.wallets().is_empty());
+        assert!(s.data_key("core", PROFILE, "contacts", None).is_ok());
     }
 
     #[test]
