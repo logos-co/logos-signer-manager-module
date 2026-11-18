@@ -518,6 +518,17 @@ impl Approvals {
         self.sign(signers, handle, Some(bundle_id_echo), secret, unlocked)
     }
 
+    /// The manager's own reading of a request's PSBT; `None` for an EVM request.
+    pub fn spend_of(&mut self, signers: &mut Registry, handle: &str) -> Result<Option<Spend>> {
+        let r = self.find(handle).ok_or_else(|| ManagerError::NotFound(handle.to_string()))?;
+        Ok(match prepare_on(signers, &r.intent, None)? {
+            Prepared::Psbt { psbt, checked, .. } => {
+                Some(Spend { sat: checked.spend.to_sat(), txid: psbt.unsigned_tx.compute_txid().to_string() })
+            }
+            Prepared::Evm { .. } => None,
+        })
+    }
+
     /// Sign as the request arrives, inside an unlock the person granted without confirmation.
     pub fn sign_unattended(&mut self, signers: &mut Registry, handle: &str) -> Result<Approved> {
         let r = self.find(handle).ok_or_else(|| ManagerError::NotFound(handle.to_string()))?;
@@ -733,6 +744,13 @@ fn cancel_job(signers: &mut Registry, r: &mut Record) {
 }
 
 // ── reading a request ───────────────────────────────────────────────────────
+
+/// What a Bitcoin request takes from the wallet, and the transaction it signs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Spend {
+    pub sat: u64,
+    pub txid: String,
+}
 
 enum Prepared {
     Evm { found: Found },
@@ -1440,6 +1458,8 @@ mod tests {
             let all = v.render_lines.join("\n");
             assert!(all.starts_with("Wallet: \"Mock "), "{all}");
             assert!(all.contains("Fee 1,190 sats"), "{all}");
+            let spend = ap.spend_of(&mut s, &h).unwrap().unwrap();
+            assert_eq!((spend.sat, spend.txid), (121_190, psbt.unsigned_tx.compute_txid().to_string()));
             assert_eq!(approve(&mut ap, &mut s, &h, &v.bundle_id, "pw").unwrap(), 1);
             let signed: Psbt = ap.fetch_result(&mut s, &h, &r).unwrap().remove(0).parse().unwrap();
             assert_eq!(signed.unsigned_tx, psbt.unsigned_tx, "signing changed the transaction");
@@ -2092,6 +2112,7 @@ mod unlock_tests {
         s.add("keystore_module", Box::new(MockSigner::new(MockOptions::default())));
         let mut ap = Approvals::new();
         let (h, r) = ap.request(&mut s, "game", &intent()).unwrap();
+        assert_eq!(ap.spend_of(&mut s, &h).unwrap(), None, "an EVM request has no Bitcoin spend");
         assert_eq!(ap.sign_unattended(&mut s, &h).unwrap(), Approved::Settled(1));
         assert_eq!(ap.fetch_result(&mut s, &h, &r).unwrap().len(), 1);
         let (h2, _) = ap.request(&mut s, "game", &intent()).unwrap();

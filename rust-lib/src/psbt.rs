@@ -29,6 +29,8 @@ pub struct Checked {
     /// The bytes the approval commitment covers: the transaction and what the lines say about it.
     pub canonical: Vec<u8>,
     pub fee: Amount,
+    /// What leaves the wallet: the inputs less what the outputs bring back, so the fee counts.
+    pub spend: Amount,
     /// Each input's `<change>/<index>` under the account, proved by derivation.
     pub keys: Vec<(u32, u32)>,
     /// Each input's previous output, as checked.
@@ -88,11 +90,13 @@ pub fn check<C: Verification>(
 
     let origin = acct.origin();
     let mut total_out = Amount::ZERO;
+    let mut returned = Amount::ZERO;
     let mut out_lines = Vec::new();
     for (txout, output) in tx.output.iter().zip(&psbt.outputs) {
         total_out = total_out.checked_add(txout.value).ok_or_else(|| bad("output amounts overflow"))?;
         match owned_output(secp, acct, output, &txout.script_pubkey) {
             Some((change, index)) => {
+                returned = returned.checked_add(txout.value).ok_or_else(|| bad("output amounts overflow"))?;
                 let what = if change == 1 { "Change" } else { "Receive" };
                 out_lines.push(format!(
                     "{what} {} BTC back to this wallet (m/{}/{change}/{index}, checked)",
@@ -110,6 +114,7 @@ pub fn check<C: Verification>(
         }
     }
     let fee = total_in.checked_sub(total_out).ok_or_else(|| bad("the outputs spend more than the inputs hold"))?;
+    let spend = total_in.checked_sub(returned).ok_or_else(|| bad("the outputs spend more than the inputs hold"))?;
 
     // The signed size, at the largest each signature can be, so the rate shown is never above the real one.
     let weight = tx.base_size() * 4 + 2 + witness;
@@ -136,7 +141,7 @@ pub fn check<C: Verification>(
         btc_amount(total_in),
         if rbf { " · replaceable (RBF)" } else { "" }
     ));
-    Ok(Checked { lines, canonical, fee, keys, prevouts })
+    Ok(Checked { lines, canonical, fee, spend, keys, prevouts })
 }
 
 fn tap_sighash_type(input: &bpsbt::Input) -> TapSighashType {
@@ -523,6 +528,7 @@ pub(crate) mod tests {
             let psbt = sample(&acct);
             let c = checked(&acct, &psbt).unwrap();
             assert_eq!(c.fee, psbt.fee().unwrap(), "{family:?}");
+            assert_eq!(c.spend, Amount::from_sat(121_190), "the payment and the fee, not the change");
             assert_eq!(c.fee.to_sat(), 1_190);
             let all = c.lines.join("\n");
             let purpose = family.purpose();
@@ -540,7 +546,9 @@ pub(crate) mod tests {
         let (_, _, acct) = ours(Family::Segwit);
         let mut psbt = sample(&acct);
         psbt.unsigned_tx.output[1].script_pubkey = theirs(Family::Segwit).script_at(&Secp256k1::new(), 1, 0).unwrap();
-        let all = checked(&acct, &psbt).unwrap().lines.join("\n");
+        let c = checked(&acct, &psbt).unwrap();
+        assert_eq!(c.spend, Amount::from_sat(150_000), "change to a stranger is spent");
+        let all = c.lines.join("\n");
         assert!(!all.contains("back to this wallet"), "{all}");
         assert_eq!(all.matches("Send ").count(), 2, "{all}");
     }

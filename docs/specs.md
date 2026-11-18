@@ -120,8 +120,8 @@ refuse or stall a request, but it can't get a false signature past the checks ab
 | `open_accounts` | — | `{ ok, open: [{ module, group }] }` |
 | `unlock` | `params_json` | `{ ok, account, expiresInMs, countLeft }` |
 | `lock` | `params_json` | `{ ok, locked }` |
-| `unlocked` | — | `{ ok, unlocked: [{ account, expiresInMs, countLeft, apps, confirm }] }` |
-| `unattended_signatures` | — | `{ ok, signed: [{ handle, requester, account, ageMs }] }` |
+| `unlocked` | — | `{ ok, unlocked: [{ account, expiresInMs, countLeft, apps, confirm, maxSpendSat, totalSpendSat, spentSat }] }` |
+| `unattended_signatures` | — | `{ ok, signed: [{ handle, requester, account, atMs, ageMs, spendSat, txid }], refused: [{ …, reason }], unreadable }` |
 | `wallets` | — | `{ ok, wallets: [{ seed, name, named, locked, kinds, privateName?, holderSeed?, device?, wayIn? }] }`; the last three only to a holder of that wallet |
 | `data_key` | `params_json` | `{ ok, key, generation, seed }`, or `{ ok: false, code: "locked" }` |
 | `enroll_seed` | `params_json` | `{ ok, seed, new, unlocked, device, wayIn }`, or `{ ok: false, code: "invalid", error, wallet }` |
@@ -322,7 +322,7 @@ terms a person chose.
   `close_account` (`{ group }`) ends that; an unlock scoped to the module alone ends with it.
 - Where a wallet's history starts is not the manager's to say: the Bitcoin wallet core keeps each
   account's birthday itself.
-- `request_unlock` takes `{ account, ttlMs?, count?, apps?, confirm?, reason? }`, the terms an app
+- `request_unlock` takes `{ account, ttlMs?, count?, apps?, confirm?, maxSpendSat?, totalSpendSat?, reason? }`, the terms an app
   asks for. `fetch_result` returns `{ ok, result: { account, terms, expiresInMs, countLeft } }`:
   the terms the person granted, which may differ.
 - **A device account** is one any signer but the keystore offers. Its database key comes from the
@@ -339,7 +339,7 @@ terms a person chose.
   `code: wrong_secret` and leaves the request on screen. The database key comes from the
   keystore's `database_key`, the unlock from its `unlock`; the manager keeps neither.
 - The keys app also unlocks and locks on its own: `unlock` (`{ account, password, ttlMs?,
-  count?, apps, confirm? }`) and `lock` (`{ account? }`, everything for `{}`). `unlocked` lists
+  count?, apps, confirm?, maxSpendSat?, totalSpendSat? }`) and `lock` (`{ account? }`, everything for `{}`). `unlocked` lists
   every unlock with its apps and confirmation, and `open_accounts` every open wallet.
 
 ### Terms
@@ -352,6 +352,17 @@ module could sign. With an unlock that covers a request:
 - **confirmed**: the approver approves with no password, and the keystore signs inside the unlock;
 - **without asking**: the request is signed as it arrives, unseen, and settles at once;
   `signed_without_asking` announces it and `unattended_signatures` lists it.
+
+An unlock that signs without asking may also cap what a Bitcoin wallet spends: `maxSpendSat` for one
+signature and `totalSpendSat` for the whole unlock. A spend is the inputs less the outputs the
+manager proves return to the wallet, so the fee counts. Every signature counts, even of the same
+coins, and a new unlock starts a new budget. Caps are refused with confirmation and on EVM accounts.
+A request over a cap is refused at once and is never offered to an approver.
+
+Each unattended signature is recorded before it is made, in `unlock/unattended.jsonl` under the
+module's data, sealed with a key any unlocked wallet opens. A record that can't be written means
+no signature. `unattended_signatures` reads the newest 4096 records across restarts. While every
+wallet is locked it lists this run's records and counts the rest as `unreadable`.
 
 A request from a module the unlock doesn't cover still needs the password. A keystore that answers
 `locked` (its time or count ran out) ends the manager's scope too, and before it shows a request as

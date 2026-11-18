@@ -7,8 +7,8 @@
 //! over a database key from the keystore. The module may read the descriptors again until it
 //! closes the wallet. An unlock request asks for an
 //! account's key to stay unlocked on terms; the person decides the terms. The keystore holds the key
-//! and enforces the time and the count; this module enforces which apps an unlock covers and
-//! whether each signature is still confirmed. Nothing here is written down.
+//! and enforces the time and the count; this module enforces which apps an unlock covers, whether
+//! each signature is still confirmed and what it may spend. Nothing here is written down.
 
 use std::time::{Duration, Instant};
 
@@ -69,6 +69,12 @@ pub struct Terms {
     /// Each signature is still confirmed in the signer. True unless the person chooses otherwise.
     #[serde(default = "yes")]
     pub confirm: bool,
+    /// Sats one unattended signature may take from a Bitcoin wallet, fee included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_spend_sat: Option<u64>,
+    /// Sats all of this unlock's unattended signatures may take together.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_spend_sat: Option<u64>,
 }
 
 fn yes() -> bool {
@@ -81,7 +87,9 @@ impl Terms {
         let count = self.count.map_or(String::new(), |n| format!(", up to {n} signature request(s)"));
         let apps = if self.apps.is_empty() { requester.to_string() } else { self.apps.join(", ") };
         let how = if self.confirm { "each one confirmed in the signer" } else { "WITHOUT showing them to you" };
-        format!("{time}{count}, for {apps}, {how}")
+        let each = self.max_spend_sat.map_or(String::new(), |n| format!(", at most {n} sats each"));
+        let total = self.total_spend_sat.map_or(String::new(), |n| format!(", {n} sats in all"));
+        format!("{time}{count}{each}{total}, for {apps}, {how}")
     }
 
     /// "Any app" is offered only with confirmation: without it every module could sign.
@@ -92,8 +100,23 @@ impl Terms {
         for a in &self.apps {
             check_displayable(a, "app")?;
         }
-        if self.count == Some(0) || self.ttl_ms == Some(0) {
+        if self.count == Some(0) || self.ttl_ms == Some(0) || self.max_spend_sat == Some(0) || self.total_spend_sat == Some(0) {
             return Err(bad("unlock: terms that allow nothing"));
+        }
+        if self.confirm && self.capped() {
+            return Err(bad("unlock: spending caps apply to signing without asking"));
+        }
+        Ok(())
+    }
+
+    fn capped(&self) -> bool {
+        self.max_spend_sat.is_some() || self.total_spend_sat.is_some()
+    }
+
+    /// Caps are read from a PSBT, so only a Bitcoin account can have them.
+    fn check_for(&self, family: &Family) -> Result<()> {
+        if self.capped() && *family == Family::Evm {
+            return Err(bad("unlock: spending caps apply to Bitcoin accounts"));
         }
         Ok(())
     }
@@ -118,13 +141,22 @@ pub enum Cover {
     WithoutAsking,
 }
 
-/// What the manager keeps of an unlock: whose it is and which apps it covers. The key and the time
-/// and count are the keystore's.
+/// An unlock's spending caps and what it has spent so far. A new unlock starts from nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Caps {
+    pub max_spend_sat: Option<u64>,
+    pub total_spend_sat: Option<u64>,
+    pub spent_sat: u64,
+}
+
+/// What the manager keeps of an unlock: whose it is, which apps it covers and what it may spend.
+/// The key and the time and count are the keystore's.
 #[derive(Debug, Clone)]
 struct Scope {
     account: String,
     apps: Vec<String>,
     confirm: bool,
+    caps: Caps,
 }
 
 #[derive(Debug, Deserialize)]
@@ -160,12 +192,23 @@ pub struct UnlockParams {
     #[serde(default = "yes")]
     pub confirm: bool,
     #[serde(default)]
+    pub max_spend_sat: Option<u64>,
+    #[serde(default)]
+    pub total_spend_sat: Option<u64>,
+    #[serde(default)]
     pub reason: String,
 }
 
 impl UnlockParams {
     pub fn terms(&self) -> Terms {
-        Terms { ttl_ms: self.ttl_ms, count: self.count, apps: self.apps.clone(), confirm: self.confirm }
+        Terms {
+            ttl_ms: self.ttl_ms,
+            count: self.count,
+            apps: self.apps.clone(),
+            confirm: self.confirm,
+            max_spend_sat: self.max_spend_sat,
+            total_spend_sat: self.total_spend_sat,
+        }
     }
 }
 
@@ -664,6 +707,7 @@ impl Access {
                 let terms = decision.unlock.unwrap_or_else(|| p.terms());
                 terms.check()?;
                 let found = signers.find(&p.account)?;
+                terms.check_for(&found.account.family)?;
                 let u = keys.unlock(&found.account.id, &password, terms.ttl_ms, terms.count)?;
                 let result = serde_json::json!({ "account": found.account.id, "terms": terms,
                                                  "expiresInMs": u.expires_in_ms, "countLeft": u.count_left });
@@ -758,6 +802,7 @@ impl Access {
             return Err(bad("unlock: name the apps it covers"));
         }
         let found = signers.find(account)?;
+        terms.check_for(&found.account.family)?;
         let u = keys.unlock(&found.account.id, password, terms.ttl_ms, terms.count)?;
         let s = scope_for(&found.account.id, terms, "");
         self.scopes.retain(|x| x.account != s.account);
@@ -798,6 +843,39 @@ impl Access {
         }
     }
 
+    pub fn caps(&self, account: &str) -> Caps {
+        self.scopes.iter().find(|s| s.account == lower(account)).map_or(Caps::default(), |s| s.caps)
+    }
+
+    /// Counts a spend against the unlock's caps, or refuses it. Under caps, a request with no
+    /// Bitcoin spend to read is refused too.
+    pub fn reserve_spend(&mut self, account: &str, spend_sat: Option<u64>) -> Result<()> {
+        let Some(s) = self.scopes.iter_mut().find(|s| s.account == lower(account)) else {
+            return Err(bad("no unlock covers this account"));
+        };
+        let caps = &mut s.caps;
+        let Some(spend) = spend_sat else {
+            let capped = caps.max_spend_sat.is_some() || caps.total_spend_sat.is_some();
+            return if capped { Err(bad("this unlock's spending caps cover Bitcoin spends only")) } else { Ok(()) };
+        };
+        if let Some(max) = caps.max_spend_sat.filter(|max| spend > *max) {
+            return Err(bad(format!("this spends {spend} sats, over the unlock's cap of {max} per signature")));
+        }
+        let total = caps.spent_sat.checked_add(spend).ok_or_else(|| bad("spending overflows"))?;
+        if let Some(cap) = caps.total_spend_sat.filter(|cap| total > *cap) {
+            return Err(bad(format!("this spends {spend} sats after {} already spent, over the unlock's cap of {cap}", caps.spent_sat)));
+        }
+        caps.spent_sat = total;
+        Ok(())
+    }
+
+    /// Nothing was signed after all: the spend no longer counts.
+    pub fn release_spend(&mut self, account: &str, spend_sat: Option<u64>) {
+        if let Some(s) = self.scopes.iter_mut().find(|s| s.account == lower(account)) {
+            s.caps.spent_sat = s.caps.spent_sat.saturating_sub(spend_sat.unwrap_or(0));
+        }
+    }
+
     /// The keystore answered `locked` for an account this module thought unlocked: its time or count ran out.
     pub fn expired(&mut self, account: &str) {
         self.scopes.retain(|s| s.account != lower(account));
@@ -822,7 +900,8 @@ fn database_holder(signers: &mut Registry, keys: &mut dyn KeyHolder, found: &Fou
 
 fn scope_for(account: &str, terms: &Terms, requester: &str) -> Scope {
     let apps = if terms.apps.is_empty() { vec![requester.to_string()] } else { terms.apps.clone() };
-    Scope { account: lower(account), apps, confirm: terms.confirm }
+    let caps = Caps { max_spend_sat: terms.max_spend_sat, total_spend_sat: terms.total_spend_sat, spent_sat: 0 };
+    Scope { account: lower(account), apps, confirm: terms.confirm, caps }
 }
 
 #[cfg(test)]
@@ -1038,7 +1117,7 @@ pub(crate) mod tests {
         let shown = a.acknowledge(&mut s, &Unlock::in_memory(), &h, &KEYS).unwrap();
         assert!(shown.lines.join("\n").contains("WITHOUT showing them to you"), "{:?}", shown.lines);
         // The person keeps confirmation on and allows ten.
-        let granted = Terms { ttl_ms: Some(600_000), count: Some(10), apps: vec!["game".into()], confirm: true };
+        let granted = Terms { ttl_ms: Some(600_000), count: Some(10), apps: vec!["game".into()], confirm: true, ..Default::default() };
         a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(None, "pw", Some(granted)), &KEYS).unwrap();
         let got = a.fetch(&h, &r).unwrap();
         assert_eq!(got["terms"]["count"], 10);
@@ -1050,13 +1129,13 @@ pub(crate) mod tests {
     fn signing_without_asking_names_its_apps_and_any_app_needs_confirmation() {
         let (mut s, mut k, mut a) = fixture();
         let acct = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
-        let any_unseen = Terms { ttl_ms: None, count: None, apps: vec!["*".into()], confirm: false };
+        let any_unseen = Terms { ttl_ms: None, count: None, apps: vec!["*".into()], confirm: false, ..Default::default() };
         assert!(a.unlock(&mut s, &mut k, acct, "pw", &any_unseen).is_err());
-        let named = Terms { ttl_ms: Some(60_000), count: Some(3), apps: vec!["game".into()], confirm: false };
+        let named = Terms { ttl_ms: Some(60_000), count: Some(3), apps: vec!["game".into()], confirm: false, ..Default::default() };
         a.unlock(&mut s, &mut k, acct, "pw", &named).unwrap();
         assert_eq!(a.covers(acct, "game"), Cover::WithoutAsking);
         assert_eq!(a.covers(acct, "wallet"), Cover::No);
-        let any_confirmed = Terms { ttl_ms: None, count: None, apps: vec!["*".into()], confirm: true };
+        let any_confirmed = Terms { ttl_ms: None, count: None, apps: vec!["*".into()], confirm: true, ..Default::default() };
         a.unlock(&mut s, &mut k, acct, "pw", &any_confirmed).unwrap();
         assert_eq!(a.covers(acct, "wallet"), Cover::Confirmed);
         assert_eq!(a.lock(&mut k, None).unwrap(), 1);
@@ -1064,10 +1143,46 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn spending_caps_hold_per_signature_and_in_all_until_a_new_unlock() {
+        let (mut s, mut k, mut a) = fixture();
+        let acct = "mock-segwit";
+        let terms = Terms { apps: vec!["maker".into()], max_spend_sat: Some(100), total_spend_sat: Some(150), ..Default::default() };
+        a.unlock(&mut s, &mut k, acct, "pw", &terms).unwrap();
+        assert_eq!(a.covers(acct, "maker"), Cover::WithoutAsking);
+
+        assert!(a.reserve_spend(acct, Some(101)).unwrap_err().to_string().contains("per signature"));
+        assert_eq!(a.caps(acct).spent_sat, 0, "a refusal spends nothing");
+        a.reserve_spend(acct, Some(100)).unwrap();
+        assert!(a.reserve_spend(acct, Some(51)).is_err(), "over the total");
+        a.release_spend(acct, Some(100));
+        a.reserve_spend(acct, Some(100)).unwrap();
+        a.reserve_spend(acct, Some(50)).unwrap();
+        assert_eq!(a.caps(acct).spent_sat, 150);
+        assert!(a.reserve_spend(acct, None).is_err(), "nothing to read, nothing signed under caps");
+
+        a.unlock(&mut s, &mut k, acct, "pw", &terms).unwrap();
+        assert_eq!(a.caps(acct).spent_sat, 0, "a new unlock is a new budget");
+    }
+
+    #[test]
+    fn spending_caps_need_an_unattended_bitcoin_unlock() {
+        let (mut s, mut k, mut a) = fixture();
+        let capped = |confirm, sat| Terms { apps: vec!["maker".into()], confirm, max_spend_sat: sat, ..Default::default() };
+        assert!(a.unlock(&mut s, &mut k, "mock-segwit", "pw", &capped(true, Some(5))).is_err(), "a person is asked anyway");
+        assert!(a.unlock(&mut s, &mut k, "mock-segwit", "pw", &capped(false, Some(0))).is_err(), "a cap of nothing");
+        let evm = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
+        assert!(a.unlock(&mut s, &mut k, evm, "pw", &capped(false, Some(5))).is_err(), "an EVM account has no PSBT to read");
+        a.unlock(&mut s, &mut k, evm, "pw", &capped(false, None)).unwrap();
+        a.reserve_spend(evm, None).unwrap();
+        let shown = capped(false, Some(5)).describe("maker");
+        assert!(shown.contains("at most 5 sats each"), "{shown}");
+    }
+
+    #[test]
     fn an_unlock_ends_here_when_the_keystore_ends_it_and_one_lock_leaves_the_rest() {
         let (mut s, mut k, mut a) = fixture();
         let acct = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
-        let terms = Terms { ttl_ms: Some(60_000), count: Some(2), apps: vec!["game".into()], confirm: true };
+        let terms = Terms { ttl_ms: Some(60_000), count: Some(2), apps: vec!["game".into()], confirm: true, ..Default::default() };
         a.unlock(&mut s, &mut k, acct, "pw", &terms).unwrap();
         // The keystore answered `locked`: its time or count ran out first.
         a.expired(acct);

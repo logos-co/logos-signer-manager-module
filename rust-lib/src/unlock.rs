@@ -65,7 +65,7 @@ fn cipher(key: &[u8; 32]) -> XChaCha20Poly1305 {
 }
 
 /// `nonce ‖ ciphertext`, as hex.
-fn seal(key: &[u8; 32], plain: &[u8], aad: &[u8]) -> String {
+pub(crate) fn seal(key: &[u8; 32], plain: &[u8], aad: &[u8]) -> String {
     let nonce = XChaCha20Poly1305::generate_nonce(&mut chacha20poly1305::aead::OsRng);
     let ct = cipher(key).encrypt(&nonce, Payload { msg: plain, aad }).expect("encrypting in memory");
     let mut out = nonce.to_vec();
@@ -73,7 +73,7 @@ fn seal(key: &[u8; 32], plain: &[u8], aad: &[u8]) -> String {
     hex::encode(out)
 }
 
-fn unseal(key: &[u8; 32], sealed: &str, aad: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+pub(crate) fn unseal(key: &[u8; 32], sealed: &str, aad: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
     let bytes = hex::decode(sealed).ok()?;
     if bytes.len() < 24 + 16 {
         return None;
@@ -344,7 +344,7 @@ fn read_json<T: Default + serde::de::DeserializeOwned>(path: &Path) -> std::resu
 }
 
 /// Staged beside it at 0600 from creation, synced, renamed over it.
-fn write_private(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_private(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let mut salt = [0u8; 8];
     rand::thread_rng().fill_bytes(&mut salt);
@@ -728,6 +728,11 @@ impl Unlock {
         }
         let root = generation_key(rec, self.key_of(target)?, g)?;
         Ok((module_key(&root, module, scope, g), g))
+    }
+
+    /// The key the record of unattended signatures is sealed under: any unlocked wallet opens it.
+    pub fn audit_key(&self) -> Result<Key> {
+        Ok(self.data_key(MANAGER, PROFILE, "unattended", None)?.0)
     }
 
     /// The private name of an unlocked seed.
