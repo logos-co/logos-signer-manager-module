@@ -715,8 +715,7 @@ impl Access {
             }
         };
         if let Some(s) = scope {
-            self.scopes.retain(|x| x.account != s.account);
-            self.scopes.push(s);
+            self.set_scope(s);
         }
         let r = &mut self.records[idx];
         r.result = Some(result);
@@ -804,10 +803,14 @@ impl Access {
         let found = signers.find(account)?;
         terms.check_for(&found.account.family)?;
         let u = keys.unlock(&found.account.id, password, terms.ttl_ms, terms.count)?;
-        let s = scope_for(&found.account.id, terms, "");
+        self.set_scope(scope_for(&found.account.id, terms, ""));
+        Ok(u)
+    }
+
+    /// A new unlock replaces the account's last one, and its budget with it.
+    fn set_scope(&mut self, s: Scope) {
         self.scopes.retain(|x| x.account != s.account);
         self.scopes.push(s);
-        Ok(u)
     }
 
     pub fn lock(&mut self, keys: &mut dyn KeyHolder, account: Option<&str>) -> Result<usize> {
@@ -1144,10 +1147,10 @@ pub(crate) mod tests {
 
     #[test]
     fn spending_caps_hold_per_signature_and_in_all_until_a_new_unlock() {
-        let (mut s, mut k, mut a) = fixture();
+        let mut a = Access::new();
         let acct = "mock-segwit";
         let terms = Terms { apps: vec!["maker".into()], max_spend_sat: Some(100), total_spend_sat: Some(150), ..Default::default() };
-        a.unlock(&mut s, &mut k, acct, "pw", &terms).unwrap();
+        a.set_scope(scope_for(acct, &terms, ""));
         assert_eq!(a.covers(acct, "maker"), Cover::WithoutAsking);
 
         assert!(a.reserve_spend(acct, Some(101)).unwrap_err().to_string().contains("per signature"));
@@ -1160,19 +1163,23 @@ pub(crate) mod tests {
         assert_eq!(a.caps(acct).spent_sat, 150);
         assert!(a.reserve_spend(acct, None).is_err(), "nothing to read, nothing signed under caps");
 
-        a.unlock(&mut s, &mut k, acct, "pw", &terms).unwrap();
+        a.set_scope(scope_for(acct, &terms, ""));
         assert_eq!(a.caps(acct).spent_sat, 0, "a new unlock is a new budget");
     }
 
     #[test]
     fn spending_caps_need_an_unattended_bitcoin_unlock() {
-        let (mut s, mut k, mut a) = fixture();
         let capped = |confirm, sat| Terms { apps: vec!["maker".into()], confirm, max_spend_sat: sat, ..Default::default() };
-        assert!(a.unlock(&mut s, &mut k, "mock-segwit", "pw", &capped(true, Some(5))).is_err(), "a person is asked anyway");
-        assert!(a.unlock(&mut s, &mut k, "mock-segwit", "pw", &capped(false, Some(0))).is_err(), "a cap of nothing");
+        assert!(capped(true, Some(5)).check().is_err(), "a person is asked anyway");
+        assert!(capped(false, Some(0)).check().is_err(), "a cap of nothing");
+        assert!(capped(false, Some(5)).check().is_ok());
+        assert!(capped(false, Some(5)).check_for(&Family::Evm).is_err(), "an EVM account has no PSBT to read");
+        assert!(capped(false, Some(5)).check_for(&Family::Bitcoin).is_ok());
+        assert!(capped(false, None).check_for(&Family::Evm).is_ok());
+
+        let mut a = Access::new();
         let evm = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
-        assert!(a.unlock(&mut s, &mut k, evm, "pw", &capped(false, Some(5))).is_err(), "an EVM account has no PSBT to read");
-        a.unlock(&mut s, &mut k, evm, "pw", &capped(false, None)).unwrap();
+        a.set_scope(scope_for(evm, &capped(false, None), ""));
         a.reserve_spend(evm, None).unwrap();
         let shown = capped(false, Some(5)).describe("maker");
         assert!(shown.contains("at most 5 sats each"), "{shown}");
