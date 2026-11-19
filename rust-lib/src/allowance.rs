@@ -221,7 +221,7 @@ impl Grant {
             out.push(format!("Fee of at most {n} sats"));
         }
         if let Some(n) = l.count {
-            out.push(format!("At most {n} signatures"));
+            out.push(format!("At most {n} signature{}", if n == 1 { "" } else { "s" }));
         }
         match &l.destinations {
             Some(list) if list.is_empty() => out.push("Pays only back to this wallet".into()),
