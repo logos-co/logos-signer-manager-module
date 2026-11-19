@@ -690,7 +690,7 @@ pub(crate) mod tests {
     use super::*;
     use logos_signer_interface::mock::{MockOptions, MockSigner};
 
-    /// The keystore's extras, in memory: password "pw", a fixed database key, held keys by account.
+    /// The keystore's extras, in memory: password `pw()`, a fixed database key, held keys by account.
     #[derive(Default)]
     pub(crate) struct FakeKeys {
         pub held: Vec<String>,
@@ -701,7 +701,7 @@ pub(crate) mod tests {
     impl KeyHolder for FakeKeys {
         fn database_key(&mut self, _: &str, password: Option<&str>) -> Result<Zeroizing<String>> {
             match password {
-                Some("pw") => Ok(Zeroizing::new("ab".repeat(32))),
+                Some(p) if p == pw() => Ok(Zeroizing::new("ab".repeat(32))),
                 _ => Err(ManagerError::Signer(logos_signer_interface::SignerError::new(
                     logos_signer_interface::ErrorCode::WrongSecret,
                     "the password for this account is not correct",
@@ -762,12 +762,24 @@ pub(crate) mod tests {
         let (h, r) = a.request_open(&mut s, &Unlock::in_memory(), "bitcoin_wallet_core_module", &req("regtest")).unwrap();
         let shown = a.acknowledge(&mut s, &Unlock::in_memory(), &h, &KEYS).unwrap();
         assert!(shown.lines.iter().any(|l| l.ends_with("test chain) on regtest")), "{:?}", shown.lines);
-        a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(None, "pw"), &KEYS).unwrap();
+        a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(None, &pw()), &KEYS).unwrap();
         assert_eq!(a.fetch(&h, &r).unwrap()["network"], "regtest");
         let (h, r) = a.request_open(&mut s, &Unlock::in_memory(), "bitcoin_wallet_core_module", r#"{"group":"mock-segwit"}"#).unwrap();
         let shown = a.acknowledge(&mut s, &Unlock::in_memory(), &h, &KEYS).unwrap();
-        a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(None, "pw"), &KEYS).unwrap();
+        a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(None, &pw()), &KEYS).unwrap();
         assert!(a.fetch(&h, &r).unwrap()["network"].is_null(), "named nothing, echoes nothing");
+    }
+
+    /// Passwords made up for this run.
+    fn pw() -> String {
+        static PW: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        PW.get_or_init(|| format!("{:016x}", rand::random::<u64>())).clone()
+    }
+    fn data_pw() -> String {
+        format!("data-{}", pw())
+    }
+    fn wrong_pw() -> String {
+        format!("wrong-{}", pw())
     }
 
     fn decide(group: Option<&str>, password: &str) -> Decision {
@@ -791,16 +803,16 @@ pub(crate) mod tests {
             (h, r, bundle)
         };
         let (h, r, b) = open(&mut a, &mut s);
-        a.approve(&mut s, &mut k, &h, &b, decide(None, "data-pw"), &KEYS).unwrap();
+        a.approve(&mut s, &mut k, &h, &b, decide(None, &data_pw()), &KEYS).unwrap();
         let got = a.fetch(&h, &r).unwrap();
         assert!(k.devices.contains_key(&("keycard_shell_module".to_string(), "mock-segwit".to_string())));
         let first = got["databaseKey"].as_str().unwrap().to_string();
 
         // Opened again: the same key, behind the password set the first time.
         let (h, r, b) = open(&mut a, &mut s);
-        assert!(a.approve(&mut s, &mut k, &h, &b, decide(None, "nope"), &KEYS).is_err());
+        assert!(a.approve(&mut s, &mut k, &h, &b, decide(None, &wrong_pw()), &KEYS).is_err());
         assert_eq!(a.status(&h, &r).unwrap().0, "rendered", "a wrong password leaves it on screen");
-        a.approve(&mut s, &mut k, &h, &b, decide(None, "data-pw"), &KEYS).unwrap();
+        a.approve(&mut s, &mut k, &h, &b, decide(None, &data_pw()), &KEYS).unwrap();
         assert_eq!(a.fetch(&h, &r).unwrap()["databaseKey"].as_str(), Some(first.as_str()));
 
         // And an allowance is refused before anything is shown.
@@ -815,11 +827,11 @@ pub(crate) mod tests {
         let (mut k, mut a) = (FakeKeys::default(), Access::new());
         // First opened through the Shell; now the card is in a reader, which is preferred.
         let shell = ("keycard_shell_module".to_string(), "mock-segwit".to_string());
-        k.devices.insert(shell.clone(), ("data-pw".into(), "cd".repeat(32)));
+        k.devices.insert(shell.clone(), (data_pw(), "cd".repeat(32)));
         assert_eq!(s.find("mock-segwit").unwrap().name, "keycard_module");
         let (h, r) = a.request_open(&mut s, &Unlock::in_memory(), "bitcoin_wallet_core_module", r#"{"group":"mock-segwit"}"#).unwrap();
         let bundle = a.acknowledge(&mut s, &Unlock::in_memory(), &h, &KEYS).unwrap().bundle_id;
-        a.approve(&mut s, &mut k, &h, &bundle, decide(None, "data-pw"), &KEYS).unwrap();
+        a.approve(&mut s, &mut k, &h, &bundle, decide(None, &data_pw()), &KEYS).unwrap();
         assert_eq!(a.fetch(&h, &r).unwrap()["databaseKey"].as_str(), Some("cd".repeat(32).as_str()));
         assert_eq!(k.devices.keys().collect::<Vec<_>>(), vec![&shell], "no second key, no second database");
     }
@@ -829,7 +841,8 @@ pub(crate) mod tests {
         let (mut s, mut k, mut a) = device_fixture();
         let (h, r) = a.request_open(&mut s, &Unlock::in_memory(), "bitcoin_wallet_core_module", OPEN).unwrap();
         let bundle = a.acknowledge(&mut s, &Unlock::in_memory(), &h, &KEYS).unwrap().bundle_id;
-        let sent = format!(r#"{{"handle":"{h}","bundle_id":"{bundle}","password":"data-pw","birthday":"2021-11-14"}}"#);
+        let password = data_pw();
+        let sent = format!(r#"{{"handle":"{h}","bundle_id":"{bundle}","password":"{password}","birthday":"2021-11-14"}}"#);
         let p: ApproveParams = serde_json::from_str(&sent).unwrap();
         let d = Decision { group: p.group, password: p.password.unwrap() };
         a.approve(&mut s, &mut k, &p.handle, &p.bundle_id, d, &KEYS).unwrap();
@@ -847,11 +860,11 @@ pub(crate) mod tests {
         let shown = a.acknowledge(&mut s, &Unlock::in_memory(), &h, &KEYS).unwrap();
         assert!(shown.lines.join("\n").contains("Any native segwit wallet on signet"), "{:?}", shown.lines);
         assert_eq!(shown.asked, serde_json::json!({ "group": null, "family": "bitcoin", "network": "signet", "seed": null }));
-        assert!(a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(None, "pw"), &KEYS).is_err(), "no wallet picked");
-        assert!(a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(Some("mock-taproot"), "pw"), &KEYS).is_err(), "wrong family");
-        assert!(a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(Some("mock-segwit"), "nope"), &KEYS).is_err());
+        assert!(a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(None, &pw()), &KEYS).is_err(), "no wallet picked");
+        assert!(a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(Some("mock-taproot"), &pw()), &KEYS).is_err(), "wrong family");
+        assert!(a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(Some("mock-segwit"), &wrong_pw()), &KEYS).is_err());
         assert_eq!(a.status(&h, &r).unwrap().0, "rendered", "a wrong password leaves it on screen");
-        a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(Some("mock-segwit"), "pw"), &KEYS).unwrap();
+        a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(Some("mock-segwit"), &pw()), &KEYS).unwrap();
         let got = a.fetch(&h, &r).unwrap();
         assert_eq!(got["group"], "mock-segwit");
         assert_eq!((got["chain"].as_str(), got["network"].as_str()), (Some("test"), Some("signet")));
@@ -944,7 +957,7 @@ pub(crate) mod tests {
         let shown = a.acknowledge(&mut s, &w, &h, &SIGNER).unwrap();
         assert!(matches!(a.acknowledge(&mut s, &w, &h, &KEYS), Err(ManagerError::Refused(_))), "the Signer app's now");
         assert!(a.reject(&h, &KEYS).is_err());
-        let custodian_way = a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(None, "pw"), &SIGNER);
+        let custodian_way = a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(None, &pw()), &SIGNER);
         assert!(matches!(custodian_way, Err(ManagerError::Refused(_))), "an approver gives consent, no password");
         a.reject(&h, &SIGNER).unwrap();
     }
