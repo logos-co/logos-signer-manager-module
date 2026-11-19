@@ -173,6 +173,19 @@ impl ParsedTx {
         }
     }
 
+    /// Where it goes (`None` deploys), what it sends, its data, and the most its gas can cost.
+    pub fn call_parts(&self) -> (Option<Address>, U256, Bytes, u128) {
+        let (to, value, input, gas, price) = match self {
+            ParsedTx::Legacy(t) => (t.to, t.value, t.input.clone(), t.gas_limit, t.gas_price),
+            ParsedTx::Eip1559(t) => (t.to, t.value, t.input.clone(), t.gas_limit, t.max_fee_per_gas),
+        };
+        let to = match to {
+            TxKind::Call(a) => Some(a),
+            TxKind::Create => None,
+        };
+        (to, value, input, u128::from(gas).saturating_mul(price))
+    }
+
     pub fn signing_hash(&self) -> B256 {
         match self {
             ParsedTx::Legacy(t) => t.signature_hash(),

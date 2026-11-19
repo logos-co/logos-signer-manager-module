@@ -21,7 +21,7 @@ use sha2::{Digest as _, Sha256};
 
 use logos_signer_interface::{verify, HashItem, JobState, Payload, RequestKind, Scheme, Secret, SignRequest, Signature, SignerInfo};
 
-use crate::allowance::{Asked, BtcSpend};
+use crate::allowance::{Asked, BtcSpend, EvmItem};
 use crate::btc::AccountPublic;
 use crate::error::{bad, ManagerError, Result};
 use crate::evm::{self, check_displayable, parse_u128, ParsedTx, UnsignedTx};
@@ -544,12 +544,25 @@ impl Approvals {
             }
             Prepared::Evm { .. } => None,
         };
+        let mut evm = Vec::new();
+        for leg in &r.intent.legs {
+            match leg {
+                Leg::Message { text } => evm.push(EvmItem::Message { text: text.clone() }),
+                Leg::TypedData { typed_data } => evm.push(EvmItem::typed_data(typed_data)),
+                Leg::Tx { chain_id, tx } => {
+                    let (to, value, input, fee) = ParsedTx::parse(tx, *chain_id)?.call_parts();
+                    evm.push(EvmItem::call(*chain_id, to, value, &input, fee));
+                }
+                Leg::Digest { .. } | Leg::Psbt { .. } => {}
+            }
+        }
         Ok(Some(Asked {
             account,
             requester: r.requester.clone(),
             on_behalf: Some(r.intent.on_behalf_of.trim().to_string()).filter(|f| !f.is_empty()),
             digest: r.intent.legs.iter().any(|l| matches!(l, Leg::Digest { .. })),
             spend,
+            evm,
         }))
     }
 

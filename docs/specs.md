@@ -361,12 +361,24 @@ spender)`:
 - **Callers** share one budget when listed together. `for` names a module behind an intermediary, as
   that intermediary reports it in the intent, and counts only from the module named. `*` is allowed
   only under review.
-- **Scope.** `spend` is Bitcoin leaving the account on one network: the inputs less the outputs the
-  manager proves return to the wallet, so the fee counts. `all` covers every kind of request and
-  requires review. Named EVM permissions follow once a calldata reader can recognize token transfers
-  and approvals.
+- **Scope.** Each is its own permission, and every part of a request must fall under one scope.
+  - `spend { network }`: Bitcoin leaving the account on one network, the inputs less the outputs
+    the manager proves return to the wallet, so the fee counts.
+  - `messages { prefix? }`: EIP-191 messages, any or those starting with `prefix`.
+  - `typed_data { contract?, name?, chainId?, primaryType? }`: EIP-712 typed data, narrowed by its
+    domain and type. Never a permit: a type named like one, a `spender` field, or Permit2's domain.
+  - `calls { chainId, contracts?, methods? }`: calls on one chain to the named contracts, or any,
+    of the named methods (selectors or signatures), or any. Never a recognized token transfer or
+    approval, even when named, a deployment, a call with no data, or one that sends ETH.
+  - `all`: every kind of request, and requires review.
+
+  Spending ETH or tokens, token approvals and deployments have no scope yet, so they always go to
+  a person. A contract that already holds an approval can still move tokens under `calls` with no
+  `contracts`, and typed data the manager doesn't recognize as a permit can still authorize an
+  off-chain order: the Signer app warns when one of these is granted for "any".
 - **Limits** are all optional, and one left out doesn't limit. Amounts are base units as decimal
-  strings. `destinations` empty pays only back to the wallet.
+  strings and apply to `spend`. `destinations` empty pays only back to the wallet. `maxFee` is sats
+  for `spend` and wei for `calls`, the gas limit times the most it pays per gas.
 - **Review.** A reviewed allowance shows each signature to a person, who confirms with no password.
   Without review it signs as the request arrives; `signed_without_asking` announces it.
 - **A bare digest** always needs the password, since nobody can read what it signs.

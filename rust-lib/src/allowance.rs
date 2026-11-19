@@ -4,13 +4,15 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
+use alloy::primitives::{keccak256, Address, U256};
+use logos_signer_interface::Family;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::btc::{self, AccountPublic};
 use crate::error::{bad, ManagerError, Result};
-use crate::evm::check_displayable;
+use crate::evm::{check_displayable, parse_address};
 use crate::registry::Registry;
 use crate::roster::KEYSTORE;
 use crate::unlock::{seal, unseal, write_private, Key};
@@ -82,8 +84,266 @@ impl Caller {
 pub enum Scope {
     /// Bitcoin leaving the account on one network, fee included.
     Spend { network: String },
+    /// EIP-191 messages: any, or those starting with `prefix`.
+    Messages {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prefix: Option<String>,
+    },
+    /// EIP-712 typed data, narrowed by its domain's contract, name or chain, or its type. Never a permit.
+    TypedData {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        contract: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, rename = "chainId", skip_serializing_if = "Option::is_none")]
+        chain_id: Option<u64>,
+        #[serde(default, rename = "primaryType", skip_serializing_if = "Option::is_none")]
+        primary_type: Option<String>,
+    },
+    /// Calls on one chain, to the named contracts or any, of the named methods or any. Never a token
+    /// transfer or approval, a deployment, or a call that sends ETH.
+    Calls {
+        #[serde(rename = "chainId")]
+        chain_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        contracts: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        methods: Option<Vec<String>>,
+    },
     /// Every kind of request, each shown to a person.
     All,
+}
+
+/// Permit2, whose every call and signature moves or approves tokens.
+const PERMIT2: &str = "0x000000000022d473030f116ddee9f6b43ac78ba3";
+
+/// Token transfers and approvals (ERC-20, 721, 777, 1155, 1363, EIP-2612, DAI, Permit2): each is
+/// its own permission, so no contract-call allowance covers one, even by name.
+const TOKEN_METHODS: &[&str] = &[
+    "transfer(address,uint256)",
+    "transferFrom(address,address,uint256)",
+    "approve(address,uint256)",
+    "increaseAllowance(address,uint256)",
+    "decreaseAllowance(address,uint256)",
+    "setApprovalForAll(address,bool)",
+    "safeTransferFrom(address,address,uint256)",
+    "safeTransferFrom(address,address,uint256,bytes)",
+    "safeTransferFrom(address,address,uint256,uint256,bytes)",
+    "safeBatchTransferFrom(address,address,uint256[],uint256[],bytes)",
+    "send(address,uint256,bytes)",
+    "operatorSend(address,address,uint256,bytes,bytes)",
+    "authorizeOperator(address)",
+    "transferAndCall(address,uint256,bytes)",
+    "transferAndCall(address,uint256)",
+    "transferFromAndCall(address,address,uint256,bytes)",
+    "approveAndCall(address,uint256,bytes)",
+    "permit(address,address,uint256,uint256,uint8,bytes32,bytes32)",
+    "permit(address,address,uint256,uint256,bool,uint8,bytes32,bytes32)",
+];
+
+fn token_method(selector: &[u8]) -> bool {
+    TOKEN_METHODS.iter().any(|sig| keccak256(sig.as_bytes())[..4] == *selector)
+}
+
+/// An address as `0x` and lowercase hex.
+fn address(s: &str) -> Result<String> {
+    Ok(format!("0x{}", hex::encode(parse_address(s)?.as_slice())))
+}
+
+/// A method as `0x` and its four bytes, from those bytes or its signature, `transfer(address,uint256)`.
+pub fn selector(s: &str) -> Result<String> {
+    let t = s.trim();
+    let not = || bad(format!("allowance: {t} is not a method"));
+    let bytes = if t.contains('(') {
+        check_displayable(t, "method")?;
+        let sig: String = t.chars().filter(|c| !c.is_whitespace()).collect();
+        keccak256(sig.as_bytes())[..4].to_vec()
+    } else {
+        hex::decode(t.strip_prefix("0x").unwrap_or(t)).map_err(|_| not())?
+    };
+    if bytes.len() != 4 {
+        return Err(not());
+    }
+    Ok(format!("0x{}", hex::encode(bytes)))
+}
+
+impl Scope {
+    fn is_evm(&self) -> bool {
+        matches!(self, Scope::Messages { .. } | Scope::TypedData { .. } | Scope::Calls { .. })
+    }
+
+    /// Checked, with addresses and methods in one spelling so equal scopes compare equal.
+    pub fn normalized(&self) -> Result<Scope> {
+        let mut s = self.clone();
+        match &mut s {
+            Scope::Spend { network } => check_displayable(network, "network")?,
+            Scope::Messages { prefix } => {
+                if let Some(p) = prefix.as_deref() {
+                    check_displayable(p, "message prefix")?;
+                }
+                if prefix.as_deref() == Some("") {
+                    *prefix = None;
+                }
+            }
+            Scope::TypedData { contract, name, primary_type, .. } => {
+                if let Some(c) = contract {
+                    *c = address(c)?;
+                }
+                for t in [name, primary_type].into_iter().flatten() {
+                    check_displayable(t, "typed data")?;
+                }
+            }
+            Scope::Calls { chain_id, contracts, methods } => {
+                if *chain_id == 0 {
+                    return Err(bad("allowance: name the chain its calls are on"));
+                }
+                for c in contracts.iter_mut().flatten() {
+                    *c = address(c)?;
+                }
+                for m in methods.iter_mut().flatten() {
+                    *m = selector(m)?;
+                }
+                if contracts.as_ref().is_some_and(Vec::is_empty) || methods.as_ref().is_some_and(Vec::is_empty) {
+                    return Err(bad("allowance: limits that allow nothing"));
+                }
+            }
+            Scope::All => {}
+        }
+        Ok(s)
+    }
+
+    /// Whether this scope is about this kind of request at all.
+    fn about(&self, item: &EvmItem) -> bool {
+        match (self, item) {
+            (Scope::Messages { .. }, EvmItem::Message { .. }) | (Scope::TypedData { .. }, EvmItem::TypedData { .. }) => true,
+            (Scope::Calls { chain_id, .. }, EvmItem::Call { chain_id: on, .. }) => chain_id == on,
+            _ => false,
+        }
+    }
+
+    /// Why a request of its kind falls outside it.
+    fn covers(&self, item: &EvmItem, max_fee: Option<u128>) -> std::result::Result<(), String> {
+        match (self, item) {
+            (Scope::Messages { prefix: Some(p) }, EvmItem::Message { text }) if !text.starts_with(p.as_str()) => {
+                Err(format!("This message doesn't start with “{p}”, as this app's allowance needs"))
+            }
+            (Scope::TypedData { contract, name, chain_id, primary_type }, EvmItem::TypedData { contract: c, name: n, chain_id: id, primary_type: t, permit }) => {
+                if *permit {
+                    return Err("This typed data is a token permit, which needs its own allowance".into());
+                }
+                if let Some(want) = primary_type.as_ref().filter(|w| *w != t) {
+                    return Err(format!("This typed data is a {t}, and this app's allowance covers only {want}"));
+                }
+                if let Some(want) = contract.as_ref().filter(|w| Some(*w) != c.as_ref()) {
+                    return Err(format!("This typed data is for {}, and this app's allowance covers only {want}", c.as_deref().unwrap_or("no contract")));
+                }
+                if let Some(want) = name.as_ref().filter(|w| Some(*w) != n.as_ref()) {
+                    return Err(format!("This typed data is for {}, and this app's allowance covers only {want}", n.as_deref().unwrap_or("no name")));
+                }
+                if let Some(want) = chain_id.filter(|w| Some(*w) != *id) {
+                    return Err(format!("This typed data is not for chain {want}, the only one this app's allowance covers"));
+                }
+                Ok(())
+            }
+            (Scope::Calls { contracts, methods, .. }, EvmItem::Call { to, method, value, fee_wei, token, .. }) => {
+                let Some(to) = to else { return Err("This deploys a contract, which a contract-call allowance doesn't cover".into()) };
+                if value != "0" {
+                    return Err(format!("This sends {value} wei with the call, which a contract-call allowance doesn't cover"));
+                }
+                let Some(method) = method else { return Err(format!("This is a plain transfer to {to}, not a contract call")) };
+                if *token {
+                    return Err("This is a token transfer or approval, which needs its own allowance".into());
+                }
+                if contracts.as_ref().is_some_and(|l| !l.contains(to)) {
+                    return Err(format!("This calls {to}, which this app's allowance doesn't name"));
+                }
+                if methods.as_ref().is_some_and(|l| !l.contains(method)) {
+                    return Err(format!("This calls method {method}, which this app's allowance doesn't name"));
+                }
+                if let Some(n) = max_fee.filter(|n| fee_wei > n) {
+                    return Err(format!("This can pay up to {fee_wei} wei in fees, over this app's limit of {n}"));
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn describe(&self) -> Vec<String> {
+        match self {
+            Scope::Spend { network } => vec![format!("Spend Bitcoin on {network}")],
+            Scope::Messages { prefix: None } => vec!["Sign any message".into()],
+            Scope::Messages { prefix: Some(p) } => vec![format!("Sign messages that start with “{p}”")],
+            Scope::TypedData { contract, name, chain_id, primary_type } => {
+                let mut line = "Sign typed data".to_string();
+                if contract.is_none() && name.is_none() && chain_id.is_none() && primary_type.is_none() {
+                    line = "Sign any typed data".into();
+                }
+                if let Some(t) = primary_type {
+                    line += &format!(" of type {t}");
+                }
+                if let Some(n) = name {
+                    line += &format!(" for {n}");
+                }
+                if let Some(c) = contract {
+                    line += &format!(" at {c}");
+                }
+                if let Some(id) = chain_id {
+                    line += &format!(" on chain {id}");
+                }
+                vec![line, "Never a token permit".into()]
+            }
+            Scope::Calls { chain_id, contracts, methods } => {
+                let mut out = vec![match contracts {
+                    None => format!("Call any contract on chain {chain_id}"),
+                    Some(list) => format!("Call {} on chain {chain_id}", list.join(", ")),
+                }];
+                if let Some(list) = methods {
+                    out.push(format!("Only methods {}", list.join(", ")));
+                }
+                out.push("Never a token transfer or approval, a deployment, or a call that sends ETH".into());
+                out
+            }
+            Scope::All => vec!["Every kind of request".into()],
+        }
+    }
+}
+
+/// An EVM request as the manager read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EvmItem {
+    Message { text: String },
+    TypedData { contract: Option<String>, name: Option<String>, chain_id: Option<u64>, primary_type: String, permit: bool },
+    /// `to` is `None` for a deployment, `method` for a call with no data. `fee_wei` is the most its gas can cost.
+    Call { chain_id: u64, to: Option<String>, method: Option<String>, value: String, fee_wei: u128, token: bool },
+}
+
+impl EvmItem {
+    pub fn typed_data(v: &Value) -> Self {
+        let domain = v.get("domain");
+        let text = |x: Option<&Value>| x.and_then(Value::as_str).map(str::to_string);
+        let contract = text(domain.and_then(|d| d.get("verifyingContract"))).and_then(|c| address(&c).ok());
+        let chain_id = domain.and_then(|d| d.get("chainId")).and_then(|c| match c {
+            Value::Number(n) => n.as_u64(),
+            Value::String(s) => match s.trim().strip_prefix("0x") {
+                Some(h) => u64::from_str_radix(h, 16).ok(),
+                None => s.trim().parse().ok(),
+            },
+            _ => None,
+        });
+        let primary_type = text(v.get("primaryType")).unwrap_or_default();
+        let permit = primary_type.to_ascii_lowercase().contains("permit")
+            || v.get("message").and_then(|m| m.get("spender")).is_some()
+            || contract.as_deref() == Some(PERMIT2);
+        EvmItem::TypedData { contract, name: text(domain.and_then(|d| d.get("name"))), chain_id, primary_type, permit }
+    }
+
+    pub fn call(chain_id: u64, to: Option<Address>, value: U256, input: &[u8], fee_wei: u128) -> Self {
+        let to = to.map(|a| format!("0x{}", hex::encode(a.as_slice())));
+        let method = input.get(..4).map(|s| format!("0x{}", hex::encode(s)));
+        let token = input.get(..4).is_some_and(token_method) || to.as_deref() == Some(PERMIT2);
+        EvmItem::Call { chain_id, to, method, value: value.to_string(), fee_wei, token }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -173,14 +433,24 @@ impl Grant {
             }
         }
         let l = &self.limits;
+        self.scope.normalized()?;
+        let amounts = l.per_request.is_some() || l.total.is_some() || l.per_period.is_some() || l.destinations.is_some();
         match &self.scope {
-            Scope::Spend { network } => check_displayable(network, "network")?,
+            Scope::Spend { .. } => {}
             Scope::All => {
                 if !self.review {
                     return Err(bad("allowance: only a reviewed allowance can cover every request"));
                 }
-                if l.per_request.is_some() || l.total.is_some() || l.per_period.is_some() || l.destinations.is_some() || l.max_fee.is_some() {
+                if amounts || l.max_fee.is_some() {
                     return Err(bad("allowance: amounts apply to spending, not to every request"));
+                }
+            }
+            s => {
+                if amounts {
+                    return Err(bad("allowance: amounts apply to spending"));
+                }
+                if l.max_fee.is_some() && !matches!(s, Scope::Calls { .. }) {
+                    return Err(bad("allowance: a fee limit applies to spending and contract calls"));
                 }
             }
         }
@@ -202,10 +472,7 @@ impl Grant {
     pub fn describe(&self) -> Vec<String> {
         let callers: Vec<_> = self.callers.iter().map(Caller::describe).collect();
         let mut out = vec![format!("For {}", callers.join(", "))];
-        out.push(match &self.scope {
-            Scope::Spend { network } => format!("Spend Bitcoin on {network}"),
-            Scope::All => "Every kind of request".to_string(),
-        });
+        out.extend(self.scope.describe());
         out.push(if self.review { "Each signature is shown to you, with no password" } else { "Signed WITHOUT showing you each one" }.into());
         let l = &self.limits;
         if let Some(n) = l.per_request {
@@ -217,8 +484,10 @@ impl Grant {
         if let Some(p) = &l.per_period {
             out.push(format!("At most {} sats every {}", p.amount, period(p.ms)));
         }
-        if let Some(n) = l.max_fee {
-            out.push(format!("Fee of at most {n} sats"));
+        match (l.max_fee, &self.scope) {
+            (Some(n), Scope::Calls { .. }) => out.push(format!("Fees of at most {n} wei per transaction")),
+            (Some(n), _) => out.push(format!("Fee of at most {n} sats")),
+            (None, _) => {}
         }
         if let Some(n) = l.count {
             out.push(format!("At most {n} signature{}", if n == 1 { "" } else { "s" }));
@@ -316,6 +585,9 @@ impl Allowance {
         if let Some(n) = l.count.filter(|n| self.used.count >= *n) {
             return Err(format!("This app has used all {n} signatures of its allowance"));
         }
+        for item in &asked.evm {
+            self.grant.scope.covers(item, l.max_fee)?;
+        }
         let Some(spend) = &asked.spend else { return Ok(()) };
         let sat = u128::from(spend.sat);
         if let Some(n) = l.per_request.filter(|n| sat > *n) {
@@ -367,6 +639,7 @@ impl Allowance {
 /// Ties a grant to the keystore's copy of its account, the one signer here that can keep a key
 /// ready, and says what the account is called.
 pub fn bind(grant: &mut Grant, signers: &mut Registry) -> Result<String> {
+    grant.scope = grant.scope.normalized()?;
     grant.check()?;
     let found = signers
         .holders(&grant.account)?
@@ -376,6 +649,9 @@ pub fn bind(grant: &mut Grant, signers: &mut Registry) -> Result<String> {
     if let Scope::Spend { network } = &mut grant.scope {
         let acct = AccountPublic::from_account(&found.account).map_err(|_| bad("allowance: spending is for Bitcoin wallets"))?;
         *network = btc::network_name(acct.chain.network(network)?).to_string();
+    }
+    if grant.scope.is_evm() && !matches!(found.account.family, Family::Evm) {
+        return Err(bad("allowance: messages, typed data and contract calls are for Ethereum accounts"));
     }
     grant.account = found.account.id.clone();
     Ok(found.account.label.clone().unwrap_or_else(|| found.account.id.clone()))
@@ -400,6 +676,7 @@ pub struct Asked {
     /// A bare digest: nobody can read what it signs, so only the password covers it.
     pub digest: bool,
     pub spend: Option<BtcSpend>,
+    pub evm: Vec<EvmItem>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -544,7 +821,8 @@ impl Allowances {
         let scope = match (&a.grant.scope, &asked.spend) {
             (Scope::All, _) => true,
             (Scope::Spend { network }, Some(s)) => network.trim().eq_ignore_ascii_case(s.network.trim()),
-            (Scope::Spend { .. }, None) => false,
+            (s, None) if s.is_evm() => !asked.evm.is_empty() && asked.evm.iter().all(|i| s.about(i)),
+            _ => false,
         };
         scope
             && lower(&a.grant.account) == lower(&asked.account)
@@ -704,6 +982,7 @@ mod tests {
                 txid: "ab".into(),
                 destinations: vec!["bcrt1qdest".into()],
             }),
+            evm: vec![],
         }
     }
 
@@ -958,5 +1237,133 @@ mod tests {
         assert_eq!(a.unneeded(10), vec![ACCOUNT.to_string()]);
         assert!(!a.is_held(ACCOUNT));
         assert!(a.get(&id).is_some(), "it stays listed until someone removes it");
+    }
+
+    const DAPP: &str = "0x1111111111111111111111111111111111111111";
+
+    fn evm_grant(scope: Scope) -> Grant {
+        Grant { callers: vec![caller("eth_app")], scope, ..spend_grant(Limits::default()) }
+    }
+
+    fn evm_asked(items: Vec<EvmItem>) -> Asked {
+        Asked { requester: "eth_app".into(), spend: None, evm: items, ..asked(0) }
+    }
+
+    fn message(text: &str) -> EvmItem {
+        EvmItem::Message { text: text.into() }
+    }
+
+    fn call(to: &str, data: &str) -> EvmItem {
+        let input = hex::decode(data.trim_start_matches("0x")).unwrap();
+        EvmItem::call(1, Some(parse_address(to).unwrap()), U256::ZERO, &input, 21_000 * 10)
+    }
+
+    fn calls(contracts: Option<Vec<&str>>, methods: Option<Vec<&str>>) -> Scope {
+        let own = |l: Option<Vec<&str>>| l.map(|v| v.into_iter().map(String::from).collect());
+        Scope::Calls { chain_id: 1, contracts: own(contracts), methods: own(methods) }.normalized().unwrap()
+    }
+
+    #[test]
+    fn methods_are_named_by_selector_or_signature() {
+        assert_eq!(selector("transfer(address,uint256)").unwrap(), "0xa9059cbb");
+        assert_eq!(selector("approve(address, uint256)").unwrap(), "0x095ea7b3");
+        assert_eq!(selector("0xA9059CBB").unwrap(), "0xa9059cbb");
+        assert!(selector("0xa9059c").is_err());
+        assert!(token_method(&hex::decode("23b872dd").unwrap()), "transferFrom");
+        assert!(token_method(&hex::decode("d505accf").unwrap()), "EIP-2612 permit");
+    }
+
+    #[test]
+    fn messages_are_their_own_permission_and_a_prefix_narrows_them() {
+        let scope = Scope::Messages { prefix: Some("Sign in to Example".into()) };
+        let (a, id) = held(evm_grant(scope));
+        assert_eq!(a.decide(&evm_asked(vec![message("Sign in to Example: nonce 7")]), 1), Verdict::Unattended(id));
+        let Verdict::Person(Some(why)) = a.decide(&evm_asked(vec![message("Transfer everything")]), 1) else { panic!("prefix") };
+        assert!(why.contains("Sign in to Example"), "{why}");
+        assert_eq!(a.decide(&evm_asked(vec![call(DAPP, "0x12345678")]), 1), Verdict::Person(None), "not a message");
+        assert_eq!(
+            a.decide(&evm_asked(vec![message("Sign in to Example"), call(DAPP, "0x12345678")]), 1),
+            Verdict::Person(None),
+            "every part of a request must be covered"
+        );
+    }
+
+    #[test]
+    fn contract_calls_cover_named_contracts_and_methods_and_never_tokens_value_or_deployments() {
+        let (a, id) = held(evm_grant(calls(Some(vec![DAPP]), Some(vec!["stake(uint256)"]))));
+        let stake = format!("{}{}", selector("stake(uint256)").unwrap(), "00".repeat(32));
+        assert_eq!(a.decide(&evm_asked(vec![call(DAPP, &stake)]), 1), Verdict::Unattended(id));
+        let outside = |item: EvmItem, words: &str| {
+            let Verdict::Person(Some(why)) = a.decide(&evm_asked(vec![item]), 1) else { panic!("{words}") };
+            assert!(why.contains(words), "{why}");
+        };
+        outside(call(DAPP, "0x2e1a7d4d"), "method 0x2e1a7d4d");
+        outside(call("0x2222222222222222222222222222222222222222", &stake), "doesn't name");
+        outside(call(DAPP, ""), "plain transfer");
+        outside(EvmItem::call(1, Some(parse_address(DAPP).unwrap()), U256::from(5), &hex::decode(&stake[2..]).unwrap(), 0), "sends 5 wei");
+        outside(EvmItem::call(1, None, U256::ZERO, &[0x60, 0x80, 0x60, 0x40], 0), "deploys");
+
+        let (any, id) = held(evm_grant(calls(None, Some(vec!["transfer(address,uint256)"]))));
+        let transfer = call(DAPP, &format!("0xa9059cbb{}", "00".repeat(64)));
+        let Verdict::Person(Some(why)) = any.decide(&evm_asked(vec![transfer]), 1) else { panic!("token") };
+        assert!(why.contains("token transfer or approval"), "named or not: {why}");
+        let other_chain = EvmItem::call(10, Some(parse_address(DAPP).unwrap()), U256::ZERO, &[1, 2, 3, 4], 0);
+        assert_eq!(any.decide(&evm_asked(vec![other_chain]), 1), Verdict::Person(None));
+        let _ = id;
+    }
+
+    #[test]
+    fn a_fee_limit_on_contract_calls_is_in_wei() {
+        let mut g = evm_grant(calls(None, None));
+        g.limits.max_fee = Some(100_000);
+        let (a, _) = held(g.clone());
+        let Verdict::Person(Some(why)) = a.decide(&evm_asked(vec![call(DAPP, "0x12345678")]), 1) else { panic!("fee") };
+        assert!(why.contains("210000 wei"), "{why}");
+        assert!(g.describe().iter().any(|l| l.contains("100000 wei")));
+    }
+
+    #[test]
+    fn typed_data_never_covers_a_permit_and_its_domain_narrows_it() {
+        let mail = json!({"primaryType":"Mail","domain":{"name":"Ether Mail","chainId":"0x1","verifyingContract":DAPP},"message":{"to":"x"}});
+        let scope = Scope::TypedData { contract: Some(DAPP.into()), name: None, chain_id: Some(1), primary_type: Some("Mail".into()) };
+        let (a, id) = held(evm_grant(scope));
+        assert_eq!(a.decide(&evm_asked(vec![EvmItem::typed_data(&mail)]), 1), Verdict::Unattended(id));
+
+        let mut elsewhere = mail.clone();
+        elsewhere["domain"]["chainId"] = json!(10);
+        assert!(matches!(a.decide(&evm_asked(vec![EvmItem::typed_data(&elsewhere)]), 1), Verdict::Person(Some(_))));
+
+        let (any, _) = held(evm_grant(Scope::TypedData { contract: None, name: None, chain_id: None, primary_type: None }));
+        let permit = json!({"primaryType":"Permit","domain":{"name":"USD Coin","chainId":1,"verifyingContract":DAPP},
+                            "message":{"owner":"a","spender":"b","value":"1","nonce":0,"deadline":1}});
+        let Verdict::Person(Some(why)) = any.decide(&evm_asked(vec![EvmItem::typed_data(&permit)]), 1) else { panic!("permit") };
+        assert!(why.contains("permit"), "{why}");
+    }
+
+    #[test]
+    fn what_an_evm_grant_may_not_say() {
+        let refused = |g: Grant| Allowances::default().grant(g, None, 0).is_err();
+        let mut amounts = evm_grant(Scope::Messages { prefix: None });
+        amounts.limits.total = Some(5);
+        assert!(refused(amounts));
+        let mut fee = evm_grant(Scope::Messages { prefix: None });
+        fee.limits.max_fee = Some(5);
+        assert!(refused(fee), "a fee limit means nothing to a message");
+        assert!(refused(evm_grant(Scope::Calls { chain_id: 0, contracts: None, methods: None })));
+        assert!(refused(evm_grant(Scope::Calls { chain_id: 1, contracts: Some(vec![]), methods: None })));
+        assert!(refused(evm_grant(Scope::Calls { chain_id: 1, contracts: Some(vec!["0x12".into()]), methods: None })));
+        assert!(!refused(evm_grant(calls(None, None))), "any contract, unattended, may be granted");
+    }
+
+    #[test]
+    fn scopes_read_and_write_as_the_wire_spells_them() {
+        let wire = r#"{"kind":"calls","chainId":1,"contracts":["0x1111111111111111111111111111111111111111"],"methods":["0xa9059cbb"]}"#;
+        let s: Scope = serde_json::from_str(wire).unwrap();
+        assert_eq!(serde_json::to_string(&s).unwrap(), wire);
+        let t: Scope = serde_json::from_str(r#"{"kind":"typed_data","primaryType":"Mail","chainId":1}"#).unwrap();
+        assert!(matches!(t, Scope::TypedData { chain_id: Some(1), .. }));
+        let m: Scope = serde_json::from_str(r#"{"kind":"messages"}"#).unwrap();
+        assert_eq!(m, Scope::Messages { prefix: None });
+        assert!(serde_json::from_str::<Scope>(r#"{"kind":"messages","text":"x"}"#).is_err());
     }
 }

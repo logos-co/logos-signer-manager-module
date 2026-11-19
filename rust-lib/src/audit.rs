@@ -206,7 +206,7 @@ mod tests {
 
     fn entry(handle: &str) -> Entry {
         let spend = BtcSpend { network: "regtest".into(), sat: 1_190, fee_sat: 10, txid: "ab".into(), destinations: vec![] };
-        let asked = Asked { account: "acct".into(), requester: "wallet".into(), on_behalf: None, digest: false, spend: Some(spend) };
+        let asked = Asked { account: "acct".into(), requester: "wallet".into(), on_behalf: None, digest: false, spend: Some(spend), evm: vec![] };
         Entry::signed(handle, &asked, How::Unattended, Some("alw_1"), None)
     }
 
