@@ -21,6 +21,7 @@ use sha2::{Digest as _, Sha256};
 
 use logos_signer_interface::{verify, HashItem, JobState, Payload, RequestKind, Scheme, Secret, SignRequest, Signature, SignerInfo};
 
+use crate::allowance::{Asked, BtcSpend};
 use crate::btc::AccountPublic;
 use crate::error::{bad, ManagerError, Result};
 use crate::evm::{self, check_displayable, parse_u128, ParsedTx, UnsignedTx};
@@ -71,6 +72,10 @@ pub struct Intent {
     /// account's roster key, used for this request only.
     #[serde(default)]
     pub xpub: String,
+    /// The module this request is made for, as the requester reports it: an allowance takes it
+    /// only from the requester it names.
+    #[serde(default, rename = "for")]
+    pub on_behalf_of: String,
 }
 
 // ── the record ──────────────────────────────────────────────────────────────
@@ -348,6 +353,7 @@ impl Approvals {
             return Err(bad("intent: no legs"));
         }
         check_displayable(&intent.purpose, "purpose")?;
+        check_displayable(&intent.on_behalf_of, "for")?;
 
         // Refused here, before anyone is shown it, only when no holder can take it.
         let mut cands = candidates(signers, &intent, &named(&intent)?)?;
@@ -501,7 +507,7 @@ impl Approvals {
 
     /// The person said yes. Re-derives the commitment, checks the approver echoed what it showed,
     /// and has the account's signer sign. A wrong secret leaves the record on screen. With no
-    /// secret, a signer that collects one signs only inside an unlock that covers the requester.
+    /// secret, a signer that collects one signs only inside an allowance that covers the requester.
     pub fn approve(
         &mut self,
         signers: &mut Registry,
@@ -518,18 +524,36 @@ impl Approvals {
         self.sign(signers, handle, Some(bundle_id_echo), secret, unlocked)
     }
 
-    /// The manager's own reading of a request's PSBT; `None` for an EVM request.
-    pub fn spend_of(&mut self, signers: &mut Registry, handle: &str) -> Result<Option<Spend>> {
+    /// What an allowance decides on: the keystore's copy of the account, as the only one that can
+    /// keep a key ready, with the manager's own reading of a PSBT. `None` when the keystore can't take it.
+    pub fn asked(&mut self, signers: &mut Registry, handle: &str) -> Result<Option<Asked>> {
         let r = self.find(handle).ok_or_else(|| ManagerError::NotFound(handle.to_string()))?;
-        Ok(match prepare_on(signers, &r.intent, None)? {
-            Prepared::Psbt { psbt, checked, .. } => {
-                Some(Spend { sat: checked.spend.to_sat(), txid: psbt.unsigned_tx.compute_txid().to_string() })
+        let cands = candidates(signers, &r.intent, &r.key)?;
+        let Some(c) = cands.into_iter().find(|c| c.found.name == KEYSTORE && c.choice.can_take) else { return Ok(None) };
+        let account = c.found.account.id.clone();
+        let spend = match prepare_on(signers, &r.intent, Some(c.found))? {
+            Prepared::Psbt { acct, psbt, checked, .. } => {
+                let [Leg::Psbt { network, .. }] = r.intent.legs.as_slice() else { return Ok(None) };
+                Some(BtcSpend {
+                    network: crate::btc::network_name(acct.chain.network(network)?).to_string(),
+                    sat: checked.spend.to_sat(),
+                    fee_sat: checked.fee.to_sat(),
+                    txid: psbt.unsigned_tx.compute_txid().to_string(),
+                    destinations: checked.destinations,
+                })
             }
             Prepared::Evm { .. } => None,
-        })
+        };
+        Ok(Some(Asked {
+            account,
+            requester: r.requester.clone(),
+            on_behalf: Some(r.intent.on_behalf_of.trim().to_string()).filter(|f| !f.is_empty()),
+            digest: r.intent.legs.iter().any(|l| matches!(l, Leg::Digest { .. })),
+            spend,
+        }))
     }
 
-    /// Sign as the request arrives, inside an unlock the person granted without confirmation.
+    /// Sign as the request arrives, inside an allowance the person granted without review.
     pub fn sign_unattended(&mut self, signers: &mut Registry, handle: &str) -> Result<Approved> {
         let r = self.find(handle).ok_or_else(|| ManagerError::NotFound(handle.to_string()))?;
         if r.state != State::Offered {
@@ -541,7 +565,7 @@ impl Approvals {
     fn sign(&mut self, signers: &mut Registry, handle: &str, echo: Option<&str>, secret: &str, unlocked: bool) -> Result<Approved> {
         let r = self.find(handle).ok_or_else(|| ManagerError::NotFound(handle.to_string()))?;
         let mut cands = candidates(signers, &r.intent, &r.key)?;
-        // Unshown, only the keystore signs, inside its unlock; shown, the holder the person chose,
+        // Unshown, only the keystore signs, with the key it holds; shown, the holder the person chose,
         // else the default they were shown.
         let pick = match (echo, &r.chosen) {
             (None, _) => cands
@@ -584,12 +608,12 @@ impl Approvals {
             r.last_error = Some(e.to_string());
             return Err(e);
         }
-        // An unlock is the keystore's: it covers no other holder of the same address.
+        // An allowance is the keystore's: it covers no other holder of the same address.
         let unlocked = unlocked && found.name == KEYSTORE;
         if secret.is_empty() && !unlocked && found.info.collects != logos_signer_interface::Collects::Nothing {
             let e = logos_signer_interface::SignerError::new(
                 logos_signer_interface::ErrorCode::Locked,
-                format!("{} is not unlocked for {}: approve with its password", found.account.id, r.requester),
+                format!("no allowance covers this for {}: approve it with {}'s password", r.requester, found.account.id),
             );
             r.last_error = Some(e.message.clone());
             return Err(e.into());
@@ -744,13 +768,6 @@ fn cancel_job(signers: &mut Registry, r: &mut Record) {
 }
 
 // ── reading a request ───────────────────────────────────────────────────────
-
-/// What a Bitcoin request takes from the wallet, and the transaction it signs.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Spend {
-    pub sat: u64,
-    pub txid: String,
-}
 
 enum Prepared {
     Evm { found: Found },
@@ -983,6 +1000,9 @@ fn render(intent: &Intent, prepared: &Prepared, bundle_id: &[u8; 32]) -> Result<
     let mut claim = Vec::new();
     if !intent.purpose.trim().is_empty() {
         claim.push(format!("Purpose (claimed by the requester): {}", intent.purpose.trim()));
+    }
+    if !intent.on_behalf_of.trim().is_empty() {
+        claim.push(format!("For (reported by the requester): {}", intent.on_behalf_of.trim()));
     }
     let mut out = Vec::new();
     if let Prepared::Psbt { checked, name, .. } = prepared {
@@ -1458,7 +1478,7 @@ mod tests {
             let all = v.render_lines.join("\n");
             assert!(all.starts_with("Wallet: \"Mock "), "{all}");
             assert!(all.contains("Fee 1,190 sats"), "{all}");
-            let spend = ap.spend_of(&mut s, &h).unwrap().unwrap();
+            let spend = ap.asked(&mut s, &h).unwrap().unwrap().spend.unwrap();
             assert_eq!((spend.sat, spend.txid), (121_190, psbt.unsigned_tx.compute_txid().to_string()));
             assert_eq!(approve(&mut ap, &mut s, &h, &v.bundle_id, "pw").unwrap(), 1);
             let signed: Psbt = ap.fetch_result(&mut s, &h, &r).unwrap().remove(0).parse().unwrap();
@@ -2082,10 +2102,10 @@ mod unlock_tests {
     const ACCT0: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
 
     fn intent() -> String {
-        format!(r#"{{"address":"{ACCT0}","legs":[{{"kind":"message","text":"inside an unlock"}}]}}"#)
+        format!(r#"{{"address":"{ACCT0}","legs":[{{"kind":"message","text":"inside an allowance"}}]}}"#)
     }
 
-    /// A signer that asks for "pw" unless its account is unlocked, as the keystore does.
+    /// A signer that asks for "pw" unless it holds the account's key, as the keystore does.
     fn unlocked_keystore() -> Registry {
         let mut r = Registry::new();
         r.add("keystore_module", Box::new(MockSigner::new(MockOptions { collects: Collects::Password, secret: "pw".into(), ..Default::default() })));
@@ -2093,14 +2113,14 @@ mod unlock_tests {
     }
 
     #[test]
-    fn without_a_password_only_a_covering_unlock_signs() {
+    fn without_a_password_only_a_covering_allowance_signs() {
         let mut s = unlocked_keystore();
         let mut ap = Approvals::new();
         let (h, _) = ap.request(&mut s, "wallet", &intent()).unwrap();
         let v = ap.acknowledge(&mut s, &h).unwrap();
         let e = ap.approve(&mut s, &h, &v.bundle_id, "", false).unwrap_err();
         assert_eq!(e.code(), Some(ErrorCode::Locked));
-        assert!(e.to_string().contains("is not unlocked for wallet"), "{e}");
+        assert!(e.to_string().contains("no allowance covers this for wallet"), "{e}");
         let (who, account) = ap.requester_and_account(&h).unwrap();
         assert_eq!(who, "wallet");
         assert!(account.eq_ignore_ascii_case(ACCT0), "{account}");
@@ -2112,7 +2132,7 @@ mod unlock_tests {
         s.add("keystore_module", Box::new(MockSigner::new(MockOptions::default())));
         let mut ap = Approvals::new();
         let (h, r) = ap.request(&mut s, "game", &intent()).unwrap();
-        assert_eq!(ap.spend_of(&mut s, &h).unwrap(), None, "an EVM request has no Bitcoin spend");
+        assert_eq!(ap.asked(&mut s, &h).unwrap().unwrap().spend, None, "an EVM request has no Bitcoin spend");
         assert_eq!(ap.sign_unattended(&mut s, &h).unwrap(), Approved::Settled(1));
         assert_eq!(ap.fetch_result(&mut s, &h, &r).unwrap().len(), 1);
         let (h2, _) = ap.request(&mut s, "game", &intent()).unwrap();

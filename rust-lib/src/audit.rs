@@ -1,5 +1,6 @@
-//! What was signed without being shown, kept across restarts: one sealed record per line, written
-//! before the signature exists. An unlocked wallet is needed to write or read it.
+//! What was signed under an allowance, or past one with the password, kept across restarts: one
+//! sealed record per line, written before the signature exists. An unlocked wallet is needed to
+//! write or read it.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -8,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::approval::Spend;
+use crate::allowance::Asked;
 use crate::error::{ManagerError, Result};
 use crate::unlock::{seal, unseal, write_private, Key};
 
@@ -24,8 +25,18 @@ pub enum Outcome {
     Signed,
     /// The signer refused after the record was written: nothing was signed.
     Failed,
-    /// A cap refused it.
-    Refused,
+}
+
+/// How a signature came to be made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum How {
+    /// Inside an allowance, shown to nobody.
+    Unattended,
+    /// Inside an allowance, confirmed by a person with no password.
+    Reviewed,
+    /// Past an allowance's limits, approved with the password. It uses none of the allowance.
+    Password,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,22 +51,27 @@ pub struct Entry {
     #[serde(default)]
     pub txid: Option<String>,
     pub outcome: Outcome,
+    pub how: How,
+    #[serde(default)]
+    pub allowance: Option<String>,
+    /// Why an allowance didn't cover it.
     #[serde(default)]
     pub reason: Option<String>,
 }
 
 impl Entry {
-    pub fn signed(handle: &str, requester: &str, account: &str, spend: Option<Spend>) -> Self {
-        let (spend_sat, txid) = spend.map_or((None, None), |s| (Some(s.sat), Some(s.txid)));
+    pub fn signed(handle: &str, asked: &Asked, how: How, allowance: Option<&str>, reason: Option<String>) -> Self {
         Entry {
             handle: handle.to_string(),
-            requester: requester.to_string(),
-            account: account.to_string(),
+            requester: asked.requester.clone(),
+            account: asked.account.clone(),
             at_ms: now_ms(),
-            spend_sat,
-            txid,
+            spend_sat: asked.spend.as_ref().map(|s| s.sat),
+            txid: asked.spend.as_ref().map(|s| s.txid.clone()),
             outcome: Outcome::Signed,
-            reason: None,
+            how,
+            allowance: allowance.map(str::to_string),
+            reason,
         }
     }
 }
@@ -80,7 +96,7 @@ pub struct Audit {
 }
 
 fn io(e: std::io::Error) -> ManagerError {
-    ManagerError::Signing(format!("writing the unattended record: {e}"))
+    ManagerError::Signing(format!("writing the signing record: {e}"))
 }
 
 /// A later record of the same request settles how it ended.
@@ -172,6 +188,7 @@ impl Audit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::allowance::BtcSpend;
     use rand::RngCore;
     use zeroize::Zeroizing;
 
@@ -188,7 +205,9 @@ mod tests {
     }
 
     fn entry(handle: &str) -> Entry {
-        Entry::signed(handle, "wallet", "acct", Some(Spend { sat: 1_190, txid: "ab".into() }))
+        let spend = BtcSpend { network: "regtest".into(), sat: 1_190, fee_sat: 10, txid: "ab".into(), destinations: vec![] };
+        let asked = Asked { account: "acct".into(), requester: "wallet".into(), on_behalf: None, digest: false, spend: Some(spend) };
+        Entry::signed(handle, &asked, How::Unattended, Some("alw_1"), None)
     }
 
     #[test]

@@ -16,9 +16,10 @@ use logos_signer_interface::{
     UnlockKeyRequest,
 };
 
-use crate::access::{Access, ApproveParams, Cover, Decision, Gate, KeyHolder, Role, Terms, Unlocked};
+use crate::access::{Access, ApproveParams, Decision, Gate, KeyHolder, Role};
+use crate::allowance::{self, Allowance, Allowances, Asked, Caller, Charge, Grant, Limits, Replaces, Scope, Verdict};
 use crate::approval::{Approvals, Approved, Move};
-use crate::audit::{self, Audit, Outcome};
+use crate::audit::{self, Audit, How, Outcome};
 use crate::gate;
 use crate::registry::Registry;
 use crate::unlock::{About, EnrollParams, Factor, Holder, Unlock};
@@ -33,8 +34,11 @@ pub trait SignerManagerModule: Send + Sync + 'static {
     fn configure(&self, config_json: String) -> String;
 
     // ── Tier B: any NAMED module may ask ────────────────────────────────
-    /// Ask a person to approve signing; returns at once with `{ ok, handle, receipt, state }`.
-    /// The handle is announced on the event plane; the receipt, returned once, authorises collecting.
+    /// Ask to sign; returns at once with `{ ok, handle, receipt, state, person, why? }`. An allowance
+    /// may settle it there; `person: true` means it waits for a person, and `why` says what an
+    /// allowance didn't cover, so the caller can cancel. The handle is announced on the event plane;
+    /// the receipt, returned once, authorises collecting. `for` in the intent names the module it is
+    /// made for, which an allowance takes only from the requester it names.
     fn request_approval(&self, intent_json: String) -> String;
     /// `{ ok, state, reason? }`: offered, rendered, signing or settled. Never the intent or results.
     fn approval_status(&self, handle: String, receipt: String) -> String;
@@ -56,9 +60,9 @@ pub trait SignerManagerModule: Send + Sync + 'static {
     /// legs, ageMs, error? }] }`.
     fn pending(&self) -> String;
     /// Claim a request for display: `{ ok, handle, bundle_id, requester, claim_lines,
-    /// render_lines, signer, collects, account, unlocked, signers, explicit }`. `collects` says what
-    /// `approve` must carry, unless `unlocked`, when an unlock covers the request and no password is
-    /// needed. `signers` are every holder of the account, ranked, as `{ signer, accountId, kind,
+    /// render_lines, signer, collects, account, unlocked, outside, signers, explicit }`. `collects`
+    /// says what `approve` must carry, unless `unlocked`, when an allowance covers the request and no
+    /// password is needed; `outside` says why one came close and didn't. `signers` are every holder of the account, ranked, as `{ signer, accountId, kind,
     /// model, transport, presence, available, collects, showsRequest, canTake, why? }`; `signer` is
     /// the one it goes to, chosen by the person when `explicit`.
     fn acknowledge(&self, handle: String) -> String;
@@ -74,29 +78,32 @@ pub trait SignerManagerModule: Send + Sync + 'static {
     /// The person said no.
     fn reject(&self, handle: String) -> bool;
 
-    // ── Opening and unlocking: asked by any named module, decided by the custodian ──
+    // ── Opening and allowances: asked by any named module, decided by a person ──
     /// Ask a person to open a Bitcoin wallet for the caller: `{ group, network?, seed? }` to reopen
     /// one (`seed` names it while its seed is locked), or `{ family, network }` to let the person
-    /// pick, create or restore one, with optional `unlock` terms and a `reason` → `{ ok, handle,
+    /// pick, create or restore one, with an optional `reason` → `{ ok, handle,
     /// receipt, state }`. Given in the Signer app, `fetch_result` returns `{ ok, result: { group,
     /// family, chain, network, external, internal, fingerprint, seed } }`, and the caller takes its
-    /// database key from `data_key`. The keys app's older path returns a `databaseKey` and
-    /// `unlocked` instead of `seed`. Tier B.
+    /// database key from `data_key`. The keys app's older path returns a `databaseKey` instead of
+    /// `seed`. Tier B.
     fn request_open(&self, params_json: String) -> String;
-    /// Ask for an account to stay unlocked: `{ account, ttlMs?, count?, apps?, confirm?, maxSpendSat?,
-    /// totalSpendSat?, reason? }`
-    /// → `{ ok, handle, receipt, state }`. The person decides the terms. Tier B.
-    fn request_unlock(&self, params_json: String) -> String;
+    /// Ask for an allowance of the caller's own: `{ account, scope, limits?, review?, endsAtRestart?,
+    /// via?, reason? }` → `{ ok, handle, receipt, state }`. `via` names the module its requests go
+    /// through. An approver grants it as asked or narrows it. Tier B.
+    fn request_allowance(&self, params_json: String) -> String;
     /// The queue: `{ ok, requests: [{ handle, requester, kind, state, ageMs, seed }] }`, `seed` the
-    /// wallet an open names when known; an approver sees opens only. Approvers and the custodian.
+    /// wallet an open names when known; `kind` is `open` or `allowance`, and the custodian sees opens
+    /// only. Approvers and the custodian.
     fn access_requests(&self) -> String;
     /// Claim one for display: `{ ok, handle, requester, kind, bundle_id, lines, asked, seed }`.
-    /// `asked` is `{ group, family, network, unlock, seed }` for an open and `{ account, terms }` for
-    /// an unlock; `seed` is the named wallet's. The first app to claim it keeps it.
+    /// `asked` is `{ group, family, network, seed }` for an open and `{ grant }` for an allowance;
+    /// `seed` is the named wallet's. The first app to claim it keeps it.
     fn acknowledge_access(&self, handle: String) -> String;
     /// The person decided: an approver's consent `{ handle, bundle_id, group? }`, once the wallet is
-    /// unlocked (`code: locked` until then), or the custodian's `{ handle, bundle_id, group?,
-    /// password, unlock? }` → `{ ok }`, or `{ ok: false, code }` with the request left on screen.
+    /// unlocked (`code: locked` until then), an approver's allowance `{ handle, bundle_id, password,
+    /// allowance?: { limits, review, endsAtRestart } }`, narrowed from what was asked, or the
+    /// custodian's `{ handle, bundle_id, group?, password }` → `{ ok }`, or `{ ok: false, code }` with
+    /// the request left on screen.
     fn approve_access(&self, params_json: String) -> String;
     /// The person said no: the app that claimed it.
     fn reject_access(&self, handle: String) -> bool;
@@ -104,20 +111,24 @@ pub trait SignerManagerModule: Send + Sync + 'static {
     /// the wallet is open for.
     fn account_descriptors(&self, group: String) -> String;
     /// Close a wallet: `{ group }` for the caller's own, or as the custodian `{ group, module }` →
-    /// `{ ok, closed }`. An unlock scoped to that module alone ends with it.
+    /// `{ ok, closed }`.
     fn close_account(&self, params_json: String) -> String;
     /// Every open wallet and its module: `{ ok, open: [{ module, group }] }`. Tier D.
     fn open_accounts(&self) -> String;
-    /// The person's own unlock, from the keys app: `{ account, password, ttlMs?, count?, apps,
-    /// confirm?, maxSpendSat?, totalSpendSat? }` → `{ ok, account, expiresInMs, countLeft }`. Tier D.
-    fn unlock(&self, params_json: String) -> String;
-    /// `{ account? }`, every account for `{}` → `{ ok, locked }`. Tier D.
-    fn lock(&self, params_json: String) -> String;
-    /// `{ ok, unlocked: [{ account, expiresInMs, countLeft, apps, confirm, maxSpendSat, totalSpendSat,
-    /// spentSat }] }`. Approver and custodian.
-    fn unlocked(&self) -> String;
-    /// Requests signed without being shown, across restarts: `{ ok, signed: [{ handle, requester,
-    /// account, ageMs, atMs, spendSat, txid }], refused: [{ .., reason }], unreadable }`. Approver and custodian.
+    /// A person's grant: `{ account, password, callers: [{ module, for? }], scope, limits?, review?,
+    /// endsAtRestart?, replaces?: { id, version } }` → `{ ok, allowance }`. Approvers.
+    fn grant_allowance(&self, params_json: String) -> String;
+    /// `{ ok, allowances: [{ id, version, account, callers, scope, review, endsAtRestart, limits,
+    /// lines, state, used }], locked, unreadable }`, `state` one of `active`, `waiting` (for the
+    /// password after a restart) or `ended`. An approver sees all; any other module its own.
+    fn allowances(&self) -> String;
+    /// `{ id }` → `{ ok, kept }`. Takes no password. Approvers.
+    fn revoke_allowance(&self, params_json: String) -> String;
+    /// Start an account's allowances again after a restart: `{ account, password }` → `{ ok }`. Approvers.
+    fn resume_allowances(&self, params_json: String) -> String;
+    /// What allowances signed, and what a person signed past one, across restarts: `{ ok, signed: [{
+    /// handle, requester, account, ageMs, atMs, spendSat, txid, how, allowance, reason }], unreadable }`,
+    /// `how` one of `unattended`, `reviewed`, `password`. Approver and custodian.
     fn unattended_signatures(&self) -> String;
 
     // ── Wallets: each seed unlocked once per session, in the Signer app ─────
@@ -200,13 +211,13 @@ pub trait SignerManagerModuleEvents {
     fn approval_progress(&self, handle: String, state: String);
     /// A signer's accounts changed; re-read `accounts`. `count` is advisory.
     fn accounts_changed(&self, count: i64);
-    /// An open or unlock request is waiting for the custodian.
+    /// An open or allowance request is waiting for a person.
     fn access_requested(&self, handle: String);
-    /// An open or unlock request reached a terminal state.
+    /// An open or allowance request reached a terminal state.
     fn access_settled(&self, handle: String, state: String);
-    /// An account was unlocked or locked.
-    fn unlock_changed(&self, account: String);
-    /// A request was signed without being shown, inside an unlock that allows it.
+    /// An account's allowances changed, or were used: re-read `allowances`.
+    fn allowances_changed(&self, account: String);
+    /// A request was signed without being shown, inside an allowance.
     fn signed_without_asking(&self, handle: String);
     /// A wallet was added, unlocked or changed: re-read `wallets`, and ask `data_key` again.
     fn wallets_changed(&self, seed: String);
@@ -249,6 +260,7 @@ impl Signer for IpcSigner {
                 shows_request: false,
                 collects: logos_signer_interface::Collects::Nothing,
                 unlock_key: false,
+                holds_key: false,
             })
     }
 
@@ -346,7 +358,7 @@ impl Signer for IpcSigner {
     }
 }
 
-/// The keystore's extras beyond the signer interface: database keys and unlocks.
+/// The keystore's extras beyond the signer interface: database keys and held keys.
 struct KeystoreKeys;
 
 fn keystore_reply(reply: Result<String, logos_rust_sdk::LogosError>) -> crate::Result<serde_json::Value> {
@@ -377,23 +389,20 @@ impl KeyHolder for KeystoreKeys {
         }).collect())
     }
 
-    fn unlock(&mut self, account: &str, password: &str, ttl_ms: Option<u64>, count: Option<u32>) -> crate::Result<Unlocked> {
-        let body = Zeroizing::new(
-            json!({ "account": account, "password": password, "ttlMs": ttl_ms, "count": count }).to_string(),
-        );
-        let v = keystore_reply(modules().keystore_module.unlock(&body))?;
-        serde_json::from_value(v).map_err(|e| ManagerError::Signing(format!("keystore unlock reply: {e}")))
+    fn hold_key(&mut self, account: &str, password: &str) -> crate::Result<()> {
+        let body = Zeroizing::new(json!({ "account": account, "password": password }).to_string());
+        keystore_reply(modules().keystore_module.hold_key(&body)).map(drop)
     }
 
-    fn lock(&mut self, account: Option<&str>) -> crate::Result<usize> {
-        let v = keystore_reply(modules().keystore_module.lock(&json!({ "account": account }).to_string()))?;
-        Ok(v.get("locked").and_then(|n| n.as_u64()).unwrap_or(0) as usize)
+    fn release_key(&mut self, account: Option<&str>) -> crate::Result<usize> {
+        let v = keystore_reply(modules().keystore_module.release_key(&json!({ "account": account }).to_string()))?;
+        Ok(v.get("released").and_then(|n| n.as_u64()).unwrap_or(0) as usize)
     }
 
-    fn unlocked(&mut self) -> crate::Result<Vec<Unlocked>> {
-        let v = keystore_reply(modules().keystore_module.unlocked())?;
-        serde_json::from_value(v.get("unlocked").cloned().unwrap_or_default())
-            .map_err(|e| ManagerError::Signing(format!("keystore unlocked reply: {e}")))
+    fn held_keys(&mut self) -> crate::Result<Vec<String>> {
+        let v = keystore_reply(modules().keystore_module.held_keys())?;
+        serde_json::from_value(v.get("held").cloned().unwrap_or_default())
+            .map_err(|e| ManagerError::Signing(format!("keystore held_keys reply: {e}")))
     }
 }
 
@@ -420,6 +429,7 @@ impl SignerManagerModuleImpl {
 struct Core {
     approvals: Approvals,
     access: Access,
+    allowances: Allowances,
     wallets: Wallets,
     audit: Audit,
     roles: gate::Roles,
@@ -478,15 +488,79 @@ impl Core {
         gate::holds_any_role(&self.roles.custodians, &Self::caller())
     }
 
-    /// Does an unlock cover this approval's requester for its account?
-    fn cover(&mut self, handle: &str) -> Cover {
-        let Some((requester, account)) = self.approvals.requester_and_account(handle) else { return Cover::No };
-        if self.access.covers(&account, &requester) == Cover::No {
-            return Cover::No;
+    /// What the allowances say of this request, and what they were decided on.
+    fn verdict(&mut self, handle: &str) -> (Verdict, Option<Asked>) {
+        match self.approvals.asked(&mut self.signers, handle) {
+            Ok(Some(asked)) => (self.allowances.decide(&asked, audit::now_ms()), Some(asked)),
+            _ => (Verdict::Person(None), None),
         }
-        // The keystore keeps the time and the count: one it has dropped covers nothing here either.
-        let _ = self.access.unlocked(&mut KeystoreKeys);
-        self.access.covers(&account, &requester)
+    }
+
+    /// Reads what was kept once a wallet is open, finishes a write that had to wait for one, and
+    /// lets go of keys nothing needs any more.
+    fn settle_allowances(&mut self) {
+        if let Ok(key) = self.wallets.store.allowance_key() {
+            self.allowances.open(&key);
+            if self.allowances.take_dirty() && self.allowances.save(&key).is_err() {
+                self.allowances.mark_dirty();
+            }
+        }
+        for account in self.allowances.unneeded(audit::now_ms()) {
+            let _ = KeystoreKeys.release_key(Some(&account));
+            emit_allowances_changed(&account);
+        }
+    }
+
+    /// Counted and on record before it signs: what can't be kept isn't signed.
+    fn admit(&mut self, handle: &str, asked: &Asked, id: &str, how: How) -> crate::Result<(Charge, audit::Entry)> {
+        let key = self.wallets.store.allowance_key()?;
+        let amount = asked.spend.as_ref().map_or(0, |s| u128::from(s.sat));
+        let charge = self.allowances.charge(id, amount, audit::now_ms())?;
+        let entry = audit::Entry::signed(handle, asked, how, Some(id), None);
+        let kept = self.allowances.save(&key).and_then(|()| self.record(entry.clone()));
+        if let Err(e) = kept {
+            self.allowances.refund(&charge);
+            let _ = self.allowances.save(&key);
+            return Err(ManagerError::Signing(format!("not signed, the record of it can't be written: {e}")));
+        }
+        Ok((charge, entry))
+    }
+
+    /// Nothing was signed after all: the allowance gets it back.
+    fn undo(&mut self, charge: &Charge, entry: audit::Entry, e: &ManagerError) {
+        self.allowances.refund(charge);
+        if let Ok(key) = self.wallets.store.allowance_key() {
+            let _ = self.allowances.save(&key);
+        }
+        if e.code() == Some(ErrorCode::Locked) {
+            self.allowances.drop_held(&entry.account);
+        }
+        let _ = self.record(audit::Entry { outcome: Outcome::Failed, ..entry });
+    }
+
+    /// A person's grant: the password is checked by holding the key, and isn't kept.
+    fn grant(&mut self, mut grant: Grant, password: &str, replaces: Option<&Replaces>) -> crate::Result<Allowance> {
+        if password.is_empty() {
+            return Err(crate::error::bad("allowance: granting takes the wallet's password"));
+        }
+        allowance::bind(&mut grant, &mut self.signers)?;
+        let key = self.wallets.store.allowance_key()?;
+        self.allowances.open(&key);
+        let before = self.allowances.list().to_vec();
+        let made = self.allowances.grant(grant, replaces, audit::now_ms())?;
+        let account = made.grant.account.clone();
+        let had = self.allowances.is_held(&account);
+        let kept = KeystoreKeys.hold_key(&account, password).and_then(|()| self.allowances.save(&key));
+        if let Err(e) = kept {
+            self.allowances.restore(before);
+            if !had {
+                let _ = KeystoreKeys.release_key(Some(&account));
+            }
+            return Err(e);
+        }
+        self.allowances.set_held(&account);
+        emit_allowances_changed(&account);
+        Ok(made)
     }
 
     fn named_caller(&self) -> Option<String> {
@@ -551,6 +625,7 @@ impl Core {
         // So does a holder working out an unlock key; its jobs are announced nowhere, so this looks.
         self.wallets.progress_all(&mut self.signers);
         self.announce_wallets();
+        self.settle_allowances();
     }
 
     fn announce_wallets(&mut self) {
@@ -559,15 +634,14 @@ impl Core {
         }
     }
 
-    /// The access gate for the caller: the custodian, else an approver.
+    /// The access gate for the caller: the roles it holds.
     fn access_gate(&self) -> Option<(String, Role)> {
         let name = self.named_caller()?;
-        let role = if self.is_custodian() {
-            Role::Custodian
-        } else if self.is_approver() {
-            Role::Approver
-        } else {
-            return None;
+        let role = match (self.is_custodian(), self.is_approver()) {
+            (true, true) => Role::Both,
+            (true, false) => Role::Custodian,
+            (false, true) => Role::Approver,
+            (false, false) => return None,
         };
         Some((name, role))
     }
@@ -611,10 +685,11 @@ impl Core {
     fn on_context_ready(&mut self, ctx: &RustModuleContext) {
         let dir = std::path::Path::new(&ctx.instance_persistence_path).join("unlock");
         self.audit = Audit::load(dir.clone());
+        self.allowances = Allowances::load(dir.clone());
         self.wallets = Wallets::new(Unlock::load(dir));
         self.bind_signers();
-        // The terms of any unlock were kept here and are gone: nothing stays unlocked past a restart.
-        let _ = KeystoreKeys.lock(None);
+        // Allowances wait for the password again after a restart, so no key stays held past one.
+        let _ = KeystoreKeys.release_key(None);
         // An always-unlocked wallet is open from the start, but a module loaded before this one
         // hears of it only once its subscription arms: say so again then.
         let me = self.me.clone();
@@ -652,55 +727,39 @@ impl Core {
             Ok(hr) => hr,
             Err(e) => return manager_err(&e),
         };
-        // Inside an unlock the person granted without confirmation, it is signed as it arrives.
-        if self.cover(&handle) == Cover::WithoutAsking {
-            // A refusal is final: unattended, nobody is there to ask instead.
-            let entry = match self.admit_unattended(&handle, &requester) {
-                Ok(entry) => entry,
-                Err(e) => {
-                    let _ = self.approvals.cancel(&mut self.signers, &handle, &receipt);
-                    emit_approval_settled(&handle, "cancelled");
-                    return manager_err(&e);
-                }
-            };
-            match self.approvals.sign_unattended(&mut self.signers, &handle) {
-                Ok(Approved::Settled(_)) => {
-                    emit_signed_without_asking(&handle);
-                    emit_approval_settled(&handle, "approved");
-                    return json!({ "ok": true, "handle": handle, "receipt": receipt, "state": "settled" }).to_string();
-                }
-                Ok(Approved::Signing) => {}
-                Err(e) => {
-                    self.access.release_spend(&entry.account, entry.spend_sat);
-                    let _ = self.record_unattended(audit::Entry { outcome: Outcome::Failed, ..entry.clone() });
-                    if e.code() == Some(ErrorCode::Locked) {
-                        self.access.expired(&entry.account);
+        let (verdict, asked) = self.verdict(&handle);
+        let mut why = match &verdict {
+            Verdict::Person(why) => why.clone(),
+            _ => None,
+        };
+        // Inside an allowance granted without review, it is signed as it arrives. If that fails, a
+        // person can still decide it.
+        if let (Verdict::Unattended(id), Some(asked)) = (&verdict, &asked) {
+            match self.admit(&handle, asked, id, How::Unattended) {
+                Err(e) => why = Some(e.to_string()),
+                Ok((charge, entry)) => match self.approvals.sign_unattended(&mut self.signers, &handle) {
+                    Ok(Approved::Settled(_)) => {
+                        emit_signed_without_asking(&handle);
+                        emit_approval_settled(&handle, "approved");
+                        emit_allowances_changed(&entry.account);
+                        return json!({ "ok": true, "handle": handle, "receipt": receipt, "state": "settled", "person": false }).to_string();
                     }
-                }
+                    Ok(Approved::Signing) => {
+                        emit_approval_progress(&handle, "signing");
+                        return json!({ "ok": true, "handle": handle, "receipt": receipt, "state": "signing", "person": false }).to_string();
+                    }
+                    Err(e) => {
+                        why = Some(format!("This app's allowance could not sign: {e}"));
+                        self.undo(&charge, entry, &e);
+                    }
+                },
             }
         }
         emit_approval_offered(&handle);
-        json!({ "ok": true, "handle": handle, "receipt": receipt, "state": "offered" }).to_string()
+        json!({ "ok": true, "handle": handle, "receipt": receipt, "state": "offered", "person": true, "why": why }).to_string()
     }
 
-    /// The caps, then the record on disk: what can't be recorded isn't signed.
-    fn admit_unattended(&mut self, handle: &str, requester: &str) -> crate::Result<audit::Entry> {
-        let account = self.approvals.requester_and_account(handle).map(|(_, a)| a).unwrap_or_default();
-        let spend = self.approvals.spend_of(&mut self.signers, handle)?;
-        let entry = audit::Entry::signed(handle, requester, &account, spend);
-        if let Err(e) = self.access.reserve_spend(&account, entry.spend_sat) {
-            let refused = audit::Entry { outcome: Outcome::Refused, reason: Some(e.to_string()), ..entry };
-            let _ = self.record_unattended(refused);
-            return Err(e);
-        }
-        if let Err(e) = self.record_unattended(entry.clone()) {
-            self.access.release_spend(&account, entry.spend_sat);
-            return Err(ManagerError::Signing(format!("not signed, the record of it can't be written: {e}")));
-        }
-        Ok(entry)
-    }
-
-    fn record_unattended(&mut self, entry: audit::Entry) -> crate::Result<()> {
+    fn record(&mut self, entry: audit::Entry) -> crate::Result<()> {
         let key = self.wallets.store.audit_key()?;
         self.audit.append(&key, entry)
     }
@@ -814,16 +873,21 @@ impl Core {
         self.shown(&handle, shown)
     }
 
-    /// The approver's view of a request. `unlocked`: an unlock covers it, so `approve` needs no
-    /// password; only the keystore's copy of an account is ever unlocked.
+    /// The approver's view of a request. `unlocked`: an allowance covers it, so `approve` needs no
+    /// password; only the keystore's copy of an account can hold its key.
     fn shown(&mut self, handle: &str, shown: crate::Result<crate::approval::Rendered>) -> String {
         match shown {
             Ok(v) => {
-                let unlocked = v.signer == crate::roster::KEYSTORE && self.cover(handle) != Cover::No;
+                let (verdict, _) = self.verdict(handle);
+                let unlocked = v.signer == crate::roster::KEYSTORE && !matches!(verdict, Verdict::Person(_));
+                let outside = match verdict {
+                    Verdict::Person(why) => why,
+                    _ => None,
+                };
                 json!({ "ok": true, "handle": v.handle, "bundle_id": v.bundle_id, "requester": v.requester,
                         "claim_lines": v.claim_lines, "render_lines": v.render_lines,
                         "signer": v.signer, "collects": v.collects, "account": v.account,
-                        "unlocked": unlocked, "signers": v.signers, "explicit": v.explicit })
+                        "unlocked": unlocked, "outside": outside, "signers": v.signers, "explicit": v.explicit })
                 .to_string()
             }
             Err(e) => manager_err(&e),
@@ -837,8 +901,32 @@ impl Core {
         }
         self.refresh();
         let keystore = self.approvals.signer_of(&handle).as_deref() == Some(crate::roster::KEYSTORE);
-        let unlocked = keystore && self.cover(&handle) != Cover::No;
-        match self.approvals.approve(&mut self.signers, &handle, &bundle_id, &password, unlocked) {
+        let (verdict, asked) = self.verdict(&handle);
+        // Confirmed with no password, it counts against the allowance that covers it.
+        let admitted = match (&verdict, &asked) {
+            (Verdict::Unattended(id) | Verdict::Review(id), Some(asked)) if keystore && password.is_empty() => {
+                match self.admit(&handle, asked, id, How::Reviewed) {
+                    Ok(admitted) => Some(admitted),
+                    Err(e) => return manager_err(&e),
+                }
+            }
+            _ => None,
+        };
+        let within = admitted.is_some();
+        let signed = self.approvals.approve(&mut self.signers, &handle, &bundle_id, &password, within);
+        if let (Err(e), Some((charge, entry))) = (&signed, admitted.clone()) {
+            self.undo(&charge, entry, e);
+        }
+        if signed.is_ok() {
+            if let Some((_, entry)) = &admitted {
+                emit_allowances_changed(&entry.account);
+            }
+            // Past an allowance with the password: it uses none of it, and stays on the record.
+            if let (Verdict::Person(Some(why)), Some(asked)) = (&verdict, &asked) {
+                let _ = self.record(audit::Entry::signed(&handle, asked, How::Password, None, Some(why.clone())));
+            }
+        }
+        match signed {
             Ok(Approved::Settled(n)) => {
                 emit_approval_settled(&handle, "approved");
                 json!({ "ok": true, "signed_count": n }).to_string()
@@ -847,15 +935,7 @@ impl Core {
                 emit_approval_progress(&handle, "signing");
                 json!({ "ok": true, "state": "signing" }).to_string()
             }
-            Err(e) => {
-                // Unlocked here but locked at the keystore: its time or count ran out.
-                if unlocked && password.is_empty() && e.code() == Some(ErrorCode::Locked) {
-                    if let Some((_, account)) = self.approvals.requester_and_account(&handle) {
-                        self.access.expired(&account);
-                    }
-                }
-                manager_err(&e)
-            }
+            Err(e) => manager_err(&e),
         }
     }
 
@@ -885,12 +965,12 @@ impl Core {
         }
     }
 
-    fn request_unlock(&mut self, params_json: String) -> String {
+    fn request_allowance(&mut self, params_json: String) -> String {
         let Some(requester) = self.named_caller() else {
             return not_authorized();
         };
         self.refresh();
-        match self.access.request_unlock(&mut self.signers, &requester, &params_json) {
+        match self.access.request_allowance(&mut self.signers, &requester, &params_json) {
             Ok((handle, receipt)) => {
                 emit_access_requested(&handle);
                 json!({ "ok": true, "handle": handle, "receipt": receipt, "state": "offered" }).to_string()
@@ -939,20 +1019,45 @@ impl Core {
             Err(e) => return err(format!("approve_access: {e}")),
         };
         self.refresh();
+        if self.access.is_allowance(&w.handle) {
+            return self.decide_allowance(&name, role, w);
+        }
         // A module holding both roles gives consent unless it brings the keystore's password.
-        let consent = w.password.is_none() && (role == Role::Approver || self.is_approver());
+        let consent = w.password.is_none() && role != Role::Custodian;
         let decided = if consent {
             let gate = Gate { caller: &name, role: Role::Approver };
             self.access.consent(&mut self.signers, &self.wallets.store, &w.handle, &w.bundle_id, w.group, &gate)
         } else {
             let password = w.password.unwrap_or_default();
-            let decision = Decision { group: w.group, password, unlock: w.unlock };
+            let decision = Decision { group: w.group, password };
             let gate = Gate { caller: &name, role };
             self.access.approve(&mut self.signers, &mut KeystoreKeys, &w.handle, &w.bundle_id, decision, &gate)
         };
         match decided {
             Err(ManagerError::Refused(why)) if why == "not authorized" => not_authorized(),
             Ok(()) => {
+                emit_access_settled(&w.handle, "approved");
+                json!({ "ok": true }).to_string()
+            }
+            Err(e) => manager_err(&e),
+        }
+    }
+
+    /// A person's answer to a module's own request: as it asked, or narrower.
+    fn decide_allowance(&mut self, name: &str, role: Role, w: ApproveParams) -> String {
+        let password = Zeroizing::new(w.password.unwrap_or_default());
+        let asked = match self.access.allowance_shown(&w.handle, &w.bundle_id, &Gate { caller: name, role }) {
+            Ok(asked) => asked,
+            Err(ManagerError::Refused(_)) => return not_authorized(),
+            Err(e) => return manager_err(&e),
+        };
+        let decided = w.allowance.map_or_else(|| asked.clone(), |n| n.applied_to(&asked));
+        if !asked.narrowed_by(&decided) {
+            return err("allowance: you can narrow what was asked for, not widen it");
+        }
+        match self.grant(decided, &password, None) {
+            Ok(made) => {
+                self.access.settle_allowance(&w.handle, made.view(true, audit::now_ms()));
                 emit_access_settled(&w.handle, "approved");
                 json!({ "ok": true }).to_string()
             }
@@ -998,10 +1103,7 @@ impl Core {
             (None, Some(me)) => me,
             _ => return not_authorized(),
         };
-        match self.access.close(&mut KeystoreKeys, &module, &w.group) {
-            Ok(closed) => json!({ "ok": true, "closed": closed }).to_string(),
-            Err(e) => manager_err(&e),
-        }
+        json!({ "ok": true, "closed": self.access.close(&module, &w.group) }).to_string()
     }
 
     fn open_accounts(&mut self) -> String {
@@ -1013,88 +1115,109 @@ impl Core {
         json!({ "ok": true, "open": list }).to_string()
     }
 
-    fn unlock(&mut self, params_json: String) -> String {
-        let params_json = Zeroizing::new(params_json);
-        if !self.is_custodian() {
-            return not_authorized();
-        }
+    fn grant_allowance(&mut self, params_json: String) -> String {
         #[derive(serde::Deserialize)]
         #[serde(rename_all = "camelCase", deny_unknown_fields)]
         struct Wire {
             account: String,
             password: String,
+            callers: Vec<Caller>,
+            scope: Scope,
             #[serde(default)]
-            ttl_ms: Option<u64>,
+            limits: Limits,
             #[serde(default)]
-            count: Option<u32>,
+            review: bool,
             #[serde(default)]
-            apps: Vec<String>,
-            #[serde(default = "confirm_by_default")]
-            confirm: bool,
+            ends_at_restart: bool,
             #[serde(default)]
-            max_spend_sat: Option<u64>,
-            #[serde(default)]
-            total_spend_sat: Option<u64>,
+            replaces: Option<Replaces>,
         }
-        fn confirm_by_default() -> bool {
-            true
+        if !self.is_approver() {
+            return not_authorized();
+        }
+        let w: Wire = match secret_params(params_json) {
+            Ok(w) => w,
+            Err(e) => return err(format!("grant_allowance: {e}")),
+        };
+        let password = Zeroizing::new(w.password);
+        self.refresh();
+        let grant = Grant { account: w.account, callers: w.callers, scope: w.scope, review: w.review,
+                            ends_at_restart: w.ends_at_restart, limits: w.limits };
+        match self.grant(grant, &password, w.replaces.as_ref()) {
+            Ok(made) => json!({ "ok": true, "allowance": made.view(true, audit::now_ms()) }).to_string(),
+            Err(e) => manager_err(&e),
+        }
+    }
+
+    fn allowances(&mut self) -> String {
+        let Some(name) = self.named_caller() else {
+            return not_authorized();
+        };
+        self.refresh();
+        if let Ok(held) = KeystoreKeys.held_keys() {
+            self.allowances.retain_held(&held);
+        }
+        let approver = self.is_approver();
+        let now = audit::now_ms();
+        let mine = |a: &&Allowance| {
+            approver || a.grant.callers.iter().any(|c| c.module == name || c.on_behalf_of.as_deref() == Some(name.as_str()))
+        };
+        let list: Vec<_> =
+            self.allowances.list().iter().filter(mine).map(|a| a.view(self.allowances.is_held(&a.grant.account), now)).collect();
+        json!({ "ok": true, "allowances": list, "locked": self.wallets.store.allowance_key().is_err(),
+                "unreadable": self.allowances.unreadable() })
+        .to_string()
+    }
+
+    fn revoke_allowance(&mut self, params_json: String) -> String {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            id: String,
+        }
+        if !self.is_approver() {
+            return not_authorized();
         }
         let w: Wire = match serde_json::from_str(&params_json) {
             Ok(w) => w,
-            Err(e) => return err(format!("unlock: {e}")),
-        };
-        let password = Zeroizing::new(w.password);
-        let terms = Terms {
-            ttl_ms: w.ttl_ms,
-            count: w.count,
-            apps: w.apps,
-            confirm: w.confirm,
-            max_spend_sat: w.max_spend_sat,
-            total_spend_sat: w.total_spend_sat,
+            Err(e) => return err(format!("revoke_allowance: {e}")),
         };
         self.refresh();
-        match self.access.unlock(&mut self.signers, &mut KeystoreKeys, &w.account, &password, &terms) {
-            Ok(u) => {
-                emit_unlock_changed(&u.account);
-                json!({ "ok": true, "account": u.account, "expiresInMs": u.expires_in_ms, "countLeft": u.count_left })
-                    .to_string()
-            }
-            Err(e) => manager_err(&e),
-        }
+        let Some(gone) = self.allowances.revoke(&w.id) else {
+            return manager_err(&ManagerError::NotFound(w.id));
+        };
+        // With every wallet locked it ends now, and is written down at the next unlock.
+        self.settle_allowances();
+        emit_allowances_changed(&gone.grant.account);
+        json!({ "ok": true, "kept": !self.allowances.is_dirty() }).to_string()
     }
 
-    fn lock(&mut self, params_json: String) -> String {
-        if !self.is_custodian() {
+    fn resume_allowances(&mut self, params_json: String) -> String {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            account: String,
+            password: String,
+        }
+        if !self.is_approver() {
             return not_authorized();
         }
-        let account: Option<String> = serde_json::from_str::<serde_json::Value>(&params_json)
-            .ok()
-            .and_then(|v| v.get("account").and_then(|a| a.as_str()).map(str::to_string));
-        match self.access.lock(&mut KeystoreKeys, account.as_deref()) {
-            Ok(n) => {
-                emit_unlock_changed(account.as_deref().unwrap_or("*"));
-                json!({ "ok": true, "locked": n }).to_string()
-            }
-            Err(e) => manager_err(&e),
-        }
-    }
-
-    fn unlocked(&mut self) -> String {
-        if !self.is_custodian() && !self.is_approver() {
-            return not_authorized();
-        }
-        match self.access.unlocked(&mut KeystoreKeys) {
-            Ok(list) => {
-                let list: Vec<_> = list
-                    .into_iter()
-                    .map(|(u, apps, confirm)| {
-                        let caps = self.access.caps(&u.account);
-                        json!({ "account": u.account, "expiresInMs": u.expires_in_ms, "countLeft": u.count_left,
-                                "apps": apps, "confirm": confirm, "maxSpendSat": caps.max_spend_sat,
-                                "totalSpendSat": caps.total_spend_sat, "spentSat": caps.spent_sat })
-                    })
-                    .collect();
-                json!({ "ok": true, "unlocked": list }).to_string()
+        let w: Wire = match secret_params(params_json) {
+            Ok(w) => w,
+            Err(e) => return err(format!("resume_allowances: {e}")),
+        };
+        let password = Zeroizing::new(w.password);
+        self.refresh();
+        let now = audit::now_ms();
+        let live = self.allowances.list().iter().find(|a| !a.ended(now) && a.grant.account.eq_ignore_ascii_case(w.account.trim()));
+        let Some(account) = live.map(|a| a.grant.account.clone()) else {
+            return err("resume_allowances: this account has no allowance to start again");
+        };
+        match KeystoreKeys.hold_key(&account, &password) {
+            Ok(()) => {
+                self.allowances.set_held(&account);
+                emit_allowances_changed(&account);
+                json!({ "ok": true }).to_string()
             }
             Err(e) => manager_err(&e),
         }
@@ -1107,21 +1230,17 @@ impl Core {
         let key = self.wallets.store.audit_key().ok();
         let listing = self.audit.read(key.as_ref());
         let now = audit::now_ms();
-        let rows = |outcome: Outcome| -> Vec<serde_json::Value> {
-            listing
-                .entries
-                .iter()
-                .filter(|e| e.outcome == outcome)
-                .map(|e| {
-                    json!({ "handle": e.handle, "requester": e.requester, "account": e.account, "atMs": e.at_ms,
-                            "ageMs": now.saturating_sub(e.at_ms), "spendSat": e.spend_sat, "txid": e.txid,
-                            "reason": e.reason })
-                })
-                .collect()
-        };
-        json!({ "ok": true, "signed": rows(Outcome::Signed), "refused": rows(Outcome::Refused),
-                "unreadable": listing.unreadable })
-        .to_string()
+        let signed: Vec<serde_json::Value> = listing
+            .entries
+            .iter()
+            .filter(|e| e.outcome == Outcome::Signed)
+            .map(|e| {
+                json!({ "handle": e.handle, "requester": e.requester, "account": e.account, "atMs": e.at_ms,
+                        "ageMs": now.saturating_sub(e.at_ms), "spendSat": e.spend_sat, "txid": e.txid,
+                        "how": e.how, "allowance": e.allowance, "reason": e.reason })
+            })
+            .collect();
+        json!({ "ok": true, "signed": signed, "unreadable": listing.unreadable }).to_string()
     }
 
     fn accounts(&mut self) -> String {
@@ -1652,8 +1771,8 @@ impl SignerManagerModule for SignerManagerModuleImpl {
         self.core().request_open(params_json)
     }
 
-    fn request_unlock(&self, params_json: String) -> String {
-        self.core().request_unlock(params_json)
+    fn request_allowance(&self, params_json: String) -> String {
+        self.core().request_allowance(params_json)
     }
 
     fn access_requests(&self) -> String {
@@ -1680,16 +1799,20 @@ impl SignerManagerModule for SignerManagerModuleImpl {
         self.core().open_accounts()
     }
 
-    fn unlock(&self, params_json: String) -> String {
-        self.core().unlock(params_json)
+    fn grant_allowance(&self, params_json: String) -> String {
+        self.core().grant_allowance(params_json)
     }
 
-    fn lock(&self, params_json: String) -> String {
-        self.core().lock(params_json)
+    fn allowances(&self) -> String {
+        self.core().allowances()
     }
 
-    fn unlocked(&self) -> String {
-        self.core().unlocked()
+    fn revoke_allowance(&self, params_json: String) -> String {
+        self.core().revoke_allowance(params_json)
+    }
+
+    fn resume_allowances(&self, params_json: String) -> String {
+        self.core().resume_allowances(params_json)
     }
 
     fn unattended_signatures(&self) -> String {

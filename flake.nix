@@ -5,12 +5,12 @@
     logos-module-builder.url = "github:logos-co/logos-module-builder";
     # The signer interface's contract, bound at runtime to each signer module by name.
     logos-signer-interface = {
-      url = "github:logos-co/logos-signer-interface/d8cfff84327c9b2b5cdb9702d1c4217cad567cee";
+      url = "github:logos-co/logos-signer-interface/566dae9482239e16bccf4afbb6194e922be72826";
       flake = false;
     };
     # The first signer: the key files. A dependency, so it loads with the manager.
     keystore_module = {
-      url = "github:logos-co/logos-evm-keystore-module/e83a899a1718ed52e3173dc85d06b15b9c68f41a";
+      url = "github:logos-co/logos-evm-keystore-module/eb27b23efe84664bcd66b3a8eb5a0eb12095fd50";
       inputs.logos-module-builder.follows = "logos-module-builder";
     };
     # The Keycard signers: optional, so they load with the manager only where installed.

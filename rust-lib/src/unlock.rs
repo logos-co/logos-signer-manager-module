@@ -735,6 +735,11 @@ impl Unlock {
         Ok(self.data_key(MANAGER, PROFILE, "unattended", None)?.0)
     }
 
+    /// The key allowances and their spending are sealed under: any unlocked wallet opens it.
+    pub fn allowance_key(&self) -> Result<Key> {
+        Ok(self.data_key(MANAGER, PROFILE, "allowances", None)?.0)
+    }
+
     /// The private name of an unlocked seed.
     pub fn about(&self, seed: &str) -> Result<About> {
         let rec = self.record(seed)?;

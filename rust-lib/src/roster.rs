@@ -180,6 +180,7 @@ mod tests {
                 shows_request: false,
                 collects: Collects::Nothing,
                 unlock_key: false,
+                holds_key: false,
             },
             account,
         }

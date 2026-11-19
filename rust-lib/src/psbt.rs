@@ -31,6 +31,8 @@ pub struct Checked {
     pub fee: Amount,
     /// What leaves the wallet: the inputs less what the outputs bring back, so the fee counts.
     pub spend: Amount,
+    /// Where the rest goes: each address paid, or `script:<hex>` for an output with no address.
+    pub destinations: Vec<String>,
     /// Each input's `<change>/<index>` under the account, proved by derivation.
     pub keys: Vec<(u32, u32)>,
     /// Each input's previous output, as checked.
@@ -92,6 +94,7 @@ pub fn check<C: Verification>(
     let mut total_out = Amount::ZERO;
     let mut returned = Amount::ZERO;
     let mut out_lines = Vec::new();
+    let mut destinations = Vec::new();
     for (txout, output) in tx.output.iter().zip(&psbt.outputs) {
         total_out = total_out.checked_add(txout.value).ok_or_else(|| bad("output amounts overflow"))?;
         match owned_output(secp, acct, output, &txout.script_pubkey) {
@@ -109,6 +112,7 @@ pub fn check<C: Verification>(
             }
             None => {
                 out_lines.push(describe_payment(txout, network));
+                destinations.push(destination(txout, network));
                 canonical.push(0);
             }
         }
@@ -141,7 +145,7 @@ pub fn check<C: Verification>(
         btc_amount(total_in),
         if rbf { " · replaceable (RBF)" } else { "" }
     ));
-    Ok(Checked { lines, canonical, fee, spend, keys, prevouts })
+    Ok(Checked { lines, canonical, fee, spend, destinations, keys, prevouts })
 }
 
 fn tap_sighash_type(input: &bpsbt::Input) -> TapSighashType {
@@ -368,6 +372,13 @@ fn owned_output<C: Verification>(
     claimed.into_iter().find(|(c, i)| acct.script_at(secp, *c, *i).is_ok_and(|s| s == *script))
 }
 
+fn destination(out: &TxOut, network: Network) -> String {
+    match Address::from_script(&out.script_pubkey, network) {
+        Ok(addr) => addr.to_string(),
+        Err(_) => format!("script:{}", hex::encode(out.script_pubkey.as_bytes())),
+    }
+}
+
 fn describe_payment(out: &TxOut, network: Network) -> String {
     let amount = btc_amount(out.value);
     if out.script_pubkey.is_op_return() {
@@ -529,6 +540,7 @@ pub(crate) mod tests {
             let c = checked(&acct, &psbt).unwrap();
             assert_eq!(c.fee, psbt.fee().unwrap(), "{family:?}");
             assert_eq!(c.spend, Amount::from_sat(121_190), "the payment and the fee, not the change");
+            assert_eq!(c.destinations.len(), 1, "the change goes nowhere new: {:?}", c.destinations);
             assert_eq!(c.fee.to_sat(), 1_190);
             let all = c.lines.join("\n");
             let purpose = family.purpose();
