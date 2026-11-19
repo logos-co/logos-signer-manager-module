@@ -153,7 +153,7 @@ fn address(s: &str) -> Result<String> {
 /// A method as `0x` and its four bytes, from those bytes or its signature, `transfer(address,uint256)`.
 pub fn selector(s: &str) -> Result<String> {
     let t = s.trim();
-    let not = || bad(format!("allowance: {t} is not a method"));
+    let not = || bad(format!("allowance: “{t}” is not a method, such as stake(uint256) or 0xa694fc3a"));
     let bytes = if t.contains('(') {
         check_displayable(t, "method")?;
         let sig: String = t.chars().filter(|c| !c.is_whitespace()).collect();
@@ -200,8 +200,10 @@ impl Scope {
                 for c in contracts.iter_mut().flatten() {
                     *c = address(c)?;
                 }
+                // A signature stays as written, for the person to read; matching goes by its selector.
                 for m in methods.iter_mut().flatten() {
-                    *m = selector(m)?;
+                    let sel = selector(m)?;
+                    *m = if m.contains('(') { m.chars().filter(|c| !c.is_whitespace()).collect() } else { sel };
                 }
                 if contracts.as_ref().is_some_and(Vec::is_empty) || methods.as_ref().is_some_and(Vec::is_empty) {
                     return Err(bad("allowance: limits that allow nothing"));
@@ -257,7 +259,7 @@ impl Scope {
                 if contracts.as_ref().is_some_and(|l| !l.contains(to)) {
                     return Err(format!("This calls {to}, which this app's allowance doesn't name"));
                 }
-                if methods.as_ref().is_some_and(|l| !l.contains(method)) {
+                if methods.as_ref().is_some_and(|l| !l.iter().any(|m| selector(m).is_ok_and(|s| &s == method))) {
                     return Err(format!("This calls method {method}, which this app's allowance doesn't name"));
                 }
                 if let Some(n) = max_fee.filter(|n| fee_wei > n) {
@@ -1271,6 +1273,8 @@ mod tests {
         assert!(selector("0xa9059c").is_err());
         assert!(token_method(&hex::decode("23b872dd").unwrap()), "transferFrom");
         assert!(token_method(&hex::decode("d505accf").unwrap()), "EIP-2612 permit");
+        let scope = calls(None, Some(vec!["stake( uint256 )", "0x2E1A7D4D"]));
+        assert!(scope.describe().iter().any(|l| l == "Only methods stake(uint256), 0x2e1a7d4d"), "{:?}", scope.describe());
     }
 
     #[test]
