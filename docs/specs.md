@@ -25,7 +25,8 @@ requester or an approver changes only the module it calls.
    back, the signer it goes to and what that signer collects: a password, a PIN, or nothing.
    It also gets every signer holding the account, so the person can choose another with
    `choose_signer` (see [One account, several signers](#one-account-several-signers)).
-   `unlocked` says an unlock covers the request, so the person approves without a password.
+   `unlocked` says an allowance covers the request, so the person approves without a password, and
+   `outside` says why an allowance that came close doesn't.
 3. The person approves. `approve` re-derives the commitment and checks the echo. It then
    computes one digest per item and calls the signer's `sign`, passing the password only
    when one was typed:
@@ -56,14 +57,16 @@ stays in `signing`, and each later call checks how the job stands:
 | B | `request_approval`, `approval_status`, `fetch_result`, `ack_result`, `cancel_approval` | any **named module**; all but the first also need the receipt |
 | B | `roster` | any **named module** |
 | C | `accounts`, `signers`, `caller_identity`, and for now `configure` | anyone |
-| B | `request_open`, `request_unlock` | any **named module**, collecting with `fetch_result` and its receipt |
+| B | `request_open`, `request_allowance` | any **named module**, collecting with `fetch_result` and its receipt |
+| B | `allowances` | any **named module** for its own; an approver for all |
 | B | `wallets`, `data_key` | any **named module**; `data_key` answers the caller's own keys only |
 | — | `enroll_seed`, `name_seed`, `forget_seed` | a configured **signer** module; `name_seed` and `forget_seed` only for a seed it holds |
 | A | `wallet_settings`, `unlock_wallet`, `unlock_progress`, `cancel_unlock`, `lock_wallets`, `set_rule`, `change_keys`, `set_names`, `create_password`, `rename_password`, `change_password`, `remove_password` | a configured **approver** |
-| A and D | `access_requests`, `acknowledge_access`, `approve_access`, `reject_access` | an approver for opens (its consent), or the custodian |
-| D | `open_accounts`, `unlock`, `lock` | a configured **custodian** (default `evm_keystore_ui`, the keys app) |
+| A | `grant_allowance`, `revoke_allowance`, `resume_allowances` | a configured **approver** |
+| A and D | `access_requests`, `acknowledge_access`, `approve_access`, `reject_access` | an approver for opens (its consent) and allowances, or the custodian for opens |
+| D | `open_accounts` | a configured **custodian** (default `evm_keystore_ui`, the keys app) |
 | — | `account_descriptors`, and `close_account` for one's own wallet | a module the wallet is open for |
-| A and D | `unlocked`, `unattended_signatures` | the approver or the custodian |
+| A and D | `unattended_signatures` | the approver or the custodian |
 
 Refusals are the identical `{"ok":false,"error":"not authorized"}`. The host anchor (the CLI)
 is never a named module.
@@ -75,7 +78,7 @@ keystore's: a role or list the document doesn't name is held by nobody, and a ma
 changes nothing. `signers` lists the signer modules consulted, in order; when several hold the same
 account, that order breaks ties between them (see
 [One account, several signers](#one-account-several-signers)). Defaults: approver `evm_signer_ui`, custodian `evm_keystore_ui`
-(for the open and unlock requests to come), signers `keystore_module`, `keycard_shell_module` and
+(for the open requests to come), signers `keystore_module`, `keycard_shell_module` and
 `keycard_module`, so a device module the person installs is consulted with nothing to configure.
 `qr_signer_module` is not a default while the QR signer is unreleased; configured, it comes last,
 and needs no connection: a Keycard Shell's account it shares with the Shell's USB module is signed
@@ -101,7 +104,7 @@ refuse or stall a request, but it can't get a false signature past the checks ab
 | `ack_result` | `handle, receipt` | `bool` |
 | `cancel_approval` | `handle, receipt` | `bool`; a signer still working is told to stop |
 | `pending` | — | `{ ok, pending: [{ handle, requester, state, purpose, legs, ageMs, error? }] }` |
-| `acknowledge` | `handle` | `{ ok, handle, bundle_id, requester, claim_lines, render_lines, signer, collects, account, unlocked, signers, explicit }`; `account` is what an unlock of it names |
+| `acknowledge` | `handle` | `{ ok, handle, bundle_id, requester, claim_lines, render_lines, signer, collects, account, unlocked, outside, signers, explicit }`; `account` is what an unlock of it names |
 | `choose_signer` | `handle, bundle_id, signer` | `acknowledge`'s reply, for the signer chosen |
 | `approval_signers` | `handle` | `acknowledge`'s reply, as the holders stand now |
 | `approve` | `handle, bundle_id, password` | `{ ok, signed_count }`, or `{ ok, state: "signing" }`, or `{ ok: false, code, error }` |
@@ -110,18 +113,20 @@ refuse or stall a request, but it can't get a false signature past the checks ab
 | `roster` | — | `{ ok, accounts: [{ key, family, chain?, address?, path?, label?, labels?, wallet?, holders, firstAddress? }] }`, each with every holder; `firstAddress` to approvers only |
 | `signers` | — | `{ ok, signers: [{ name, info? }] }` |
 | `caller_identity` | — | `{ ok, kind, identity, approvers, custodians, signers }`: everything a total `configure` must repeat |
-| `request_open`, `request_unlock` | `params_json` | `{ ok, handle, receipt, state }` |
-| `access_requests` | — | `{ ok, requests: [{ handle, requester, kind, state, ageMs, seed }] }`; opens only, for an approver |
+| `request_approval` | `intent_json` | `{ ok, handle, receipt, state, person, why? }` |
+| `request_open`, `request_allowance` | `params_json` | `{ ok, handle, receipt, state }` |
+| `access_requests` | — | `{ ok, requests: [{ handle, requester, kind, state, ageMs, seed }] }`; opens only, for the custodian |
 | `acknowledge_access` | `handle` | `{ ok, handle, requester, kind, bundle_id, lines, asked, seed }` |
 | `approve_access` | `params_json` | `{ ok }`, or `{ ok: false, code, error }` |
 | `reject_access` | `handle` | `bool` |
 | `account_descriptors` | `group` | `{ ok, group, external, internal }` |
 | `close_account` | `params_json` | `{ ok, closed }` |
 | `open_accounts` | — | `{ ok, open: [{ module, group }] }` |
-| `unlock` | `params_json` | `{ ok, account, expiresInMs, countLeft }` |
-| `lock` | `params_json` | `{ ok, locked }` |
-| `unlocked` | — | `{ ok, unlocked: [{ account, expiresInMs, countLeft, apps, confirm }] }` |
-| `unattended_signatures` | — | `{ ok, signed: [{ handle, requester, account, ageMs }] }` |
+| `grant_allowance` | `params_json` | `{ ok, allowance }` |
+| `allowances` | — | `{ ok, allowances: [{ id, version, account, callers, scope, review, endsAtRestart, limits, lines, state, used }], locked, unreadable }` |
+| `revoke_allowance` | `params_json` | `{ ok, kept }` |
+| `resume_allowances` | `params_json` | `{ ok }` |
+| `unattended_signatures` | — | `{ ok, signed: [{ handle, requester, account, atMs, ageMs, spendSat, txid, how, allowance, reason }], unreadable }` |
 | `wallets` | — | `{ ok, wallets: [{ seed, name, named, locked, kinds, privateName?, holderSeed?, device?, wayIn? }] }`; the last three only to a holder of that wallet |
 | `data_key` | `params_json` | `{ ok, key, generation, seed }`, or `{ ok: false, code: "locked" }` |
 | `enroll_seed` | `params_json` | `{ ok, seed, new, unlocked, device, wayIn }`, or `{ ok: false, code: "invalid", error, wallet }` |
@@ -180,7 +185,7 @@ A request goes to the first holder that is ready and can take it, unless the per
   since it was shown answers `signer_changed`, and the next `approve` signs with the new one. The
   request stays on screen either way.
 
-Only the keystore's copy of an account is ever unlocked. Signing unattended goes to the keystore,
+Only the keystore's copy of an account can hold its key. Signing unattended goes to the keystore,
 and approving with no password needs the keystore chosen.
 
 A device's Bitcoin wallet keeps one database key, whichever holder opens it. The keystore keeps it
@@ -296,12 +301,11 @@ restart or a `lock_wallets`.
 - `data_key`, `enroll_seed`, `name_seed` and `forget_seed` answer a module that may be waiting on its own call,
   so they call out to no module.
 
-## Opening and unlocking
+## Opening wallets
 
 A Bitcoin wallet's descriptors reach a module only once a person opens the wallet for it: in the
 Signer app, an approver's consent once the wallet is unlocked, or in the keys app, the custodian's
-older path with a database key from the keystore. An account stays unlocked for signing only on
-terms a person chose.
+older path with a database key from the keystore.
 
 - **Consent.** An approver claims an open with `acknowledge_access`, which names the wallet's
   `seed` so the app shows it beside the wallet, and approves it with `{ handle, bundle_id, group?
@@ -309,60 +313,115 @@ terms a person chose.
   group, family, chain, network, external, internal, fingerprint, seed }`, with no database key:
   the module takes its own from `data_key(seed, …)`. A request may name the wallet by `{ group,
   seed }` while its seed is locked and no signer lists it; it is checked once unlocked.
-  An approver decides opens only, and the first app to claim a request keeps it.
+  The first app to claim a request keeps it.
 
 - `request_open` takes `{ group, network? }` to reopen a wallet, or `{ family, network }` to let the
-  person pick, create or restore one, with optional `unlock` terms and a `reason`. A network must
+  person pick, create or restore one, with an optional `reason`. A network must
   belong to the wallet's chain (`main` or `test`); a request naming the wrong one is refused before
   anything is shown. It answers `{ ok, handle, receipt, state }`. Once the custodian approves,
   `fetch_result` with the receipt returns `{ ok, result: { group, family, chain, network, external,
-  internal, fingerprint, databaseKey, unlocked } }`, `network` being the one the request named,
+  internal, fingerprint, databaseKey } }`, `network` being the one the request named,
   and the wallet is **open** for that module: `account_descriptors(group)`, the wallet's id as a
   plain string, answers `{ ok, group, external, internal }` to it again, and to nobody else.
-  `close_account` (`{ group }`) ends that; an unlock scoped to the module alone ends with it.
+  `close_account` (`{ group }`) ends that.
 - Where a wallet's history starts is not the manager's to say: the Bitcoin wallet core keeps each
   account's birthday itself.
-- `request_unlock` takes `{ account, ttlMs?, count?, apps?, confirm?, reason? }`, the terms an app
-  asks for. `fetch_result` returns `{ ok, result: { account, terms, expiresInMs, countLeft } }`:
-  the terms the person granted, which may differ.
 - **A device account** is one any signer but the keystore offers. Its database key comes from the
   keystore's `device_database_key`, made at the first open under the password the person sets in
-  the keys app. Every later open needs that password. A device signs on its own screen, so it has
-  nothing to unlock: terms in the decision are refused, the app's own are not granted, and
-  `request_unlock` for it is refused before anything is shown.
-- A requester has at most two open or unlock requests pending, and one nobody shows within five
+  the keys app. Every later open needs that password. A device signs on its own screen, so
+  `request_allowance` for it is refused before anything is shown.
+- A requester has at most two open or allowance requests pending, and one nobody shows within five
   minutes settles `expired_no_ack`.
 - The custodian (the keys app) works the queue with `access_requests`, `acknowledge_access` (the
   lines to show, the commitment to echo, and `asked`: the wallet or the family and network to pick
-  from, and the terms the app wants), `approve_access` (`{ handle, bundle_id, group?, password,
-  unlock? }`, an older keys app's `birthday` ignored) and `reject_access`. A wrong password answers
+  from), `approve_access` (`{ handle, bundle_id, group?, password }`, an older keys app's
+  `birthday` ignored) and `reject_access`. A wrong password answers
   `code: wrong_secret` and leaves the request on screen. The database key comes from the
-  keystore's `database_key`, the unlock from its `unlock`; the manager keeps neither.
-- The keys app also unlocks and locks on its own: `unlock` (`{ account, password, ttlMs?,
-  count?, apps, confirm? }`) and `lock` (`{ account? }`, everything for `{}`). `unlocked` lists
-  every unlock with its apps and confirmation, and `open_accounts` every open wallet.
+  keystore's `database_key`; the manager doesn't keep it.
+- `open_accounts` lists every open wallet.
 
-### Terms
+## Allowances
 
-The keystore holds an unlocked key and enforces its **time** and **count**; the manager enforces
-which **apps** it covers and whether each signature is still **confirmed**. An empty `apps` means
-the module that asked. `"*"` covers any app, and only with confirmation, because without it every
-module could sign. With an unlock that covers a request:
+An allowance lets named apps have an account sign without its password. It only ever removes a
+prompt: a request none covers goes to a person, as any request does. Signing policy lives here. The
+keystore keeps a key ready on the manager's word (`hold_key`, `release_key`), with no terms of its
+own, and only a signer that declares `holdsKey` takes an allowance, so Keycards and QR signers don't.
 
-- **confirmed**: the approver approves with no password, and the keystore signs inside the unlock;
-- **without asking**: the request is signed as it arrives, unseen, and settles at once;
-  `signed_without_asking` announces it and `unattended_signatures` lists it.
+An allowance is one per account, caller and scope, generalized from ERC-20's `allowance(owner,
+spender)`:
 
-A request from a module the unlock doesn't cover still needs the password. A keystore that answers
-`locked` (its time or count ran out) ends the manager's scope too, and before it shows a request as
-covered or signs one unseen, the manager checks the keystore still holds that unlock. The manager locks every account
-when it starts, since the terms it kept are gone.
+```json
+{ "account": "<wallet>", "callers": [{ "module": "bitcoin_wallet_core_module", "for": "maker" }],
+  "scope": { "kind": "spend", "network": "mainnet" }, "review": false, "endsAtRestart": false,
+  "limits": { "perRequest": "100000", "total": "1000000",
+              "perPeriod": { "amount": "500000", "ms": 86400000 }, "count": 50,
+              "expiresAtMs": 1795010580000, "destinations": ["bc1q…"], "maxFee": "5000" } }
+```
+
+- **Callers** share one budget when listed together. `for` names a module behind an intermediary, as
+  that intermediary reports it in the intent, and counts only from the module named. `*` is allowed
+  only under review.
+- **Scope.** Each is its own permission, and every part of a request must fall under one scope.
+  - `spend { network }`: Bitcoin leaving the account on one network, the inputs less the outputs
+    the manager proves return to the wallet, so the fee counts.
+  - `messages { prefix? }`: EIP-191 messages, any or those starting with `prefix`.
+  - `typed_data { contract?, name?, chainId?, primaryType? }`: EIP-712 typed data, narrowed by its
+    domain and type. Never a permit: a type named like one, a `spender` field, or Permit2's domain.
+  - `calls { chainId, contracts?, methods? }`: calls on one chain to the named contracts, or any,
+    of the named methods (selectors or signatures), or any. Never a recognized token transfer or
+    approval, even when named, a deployment, a call with no data, or one that sends ETH.
+  - `all`: every kind of request, and requires review.
+
+  Spending ETH or tokens, token approvals and deployments have no scope yet, so they always go to
+  a person. A contract that already holds an approval can still move tokens under `calls` with no
+  `contracts`, and typed data the manager doesn't recognize as a permit can still authorize an
+  off-chain order: the Signer app warns when one of these is granted for "any".
+- **Limits** are all optional, and one left out doesn't limit. Amounts are base units as decimal
+  strings and apply to `spend`. `destinations` empty pays only back to the wallet. `maxFee` is sats
+  for `spend` and wei for `calls`, the gas limit times the most it pays per gas.
+- **Review.** A reviewed allowance shows each signature to a person, who confirms with no password.
+  Without review it signs as the request arrives; `signed_without_asking` announces it.
+- **A bare digest** always needs the password, since nobody can read what it signs.
+
+**Deciding a request.** Allowances without review are tried first, then reviewed ones, closest fit
+first. Over a limit, the request goes to the next that fits, then to a person with the password.
+`request_approval` answers `person: true` and `why` at once, so the caller can cancel; `acknowledge`
+gives the approver the same words as `outside`. A signature approved past an allowance with the
+password uses none of it, and is listed with `how: "password"`.
+
+**Granting.** Three ways, all with the wallet's password, which the keystore checks when it takes
+the key and doesn't keep:
+
+- `grant_allowance` from an approver (the Signer app or `evm_signer_cli`). `replaces: { id, version }`
+  replaces one, clearing its use as ERC-20's `approve` does, and is refused if it was used after the
+  person saw it.
+- `request_allowance` from a module, for itself only: `{ account, scope, limits?, review?,
+  endsAtRestart?, via?, reason? }`. An approver answers through `approve_access` with `{ handle,
+  bundle_id, password, allowance?: { limits, review, endsAtRestart } }`, and may narrow what was
+  asked for but never widen it.
+- `revoke_allowance` takes no password. With every wallet locked it ends at once and is written down
+  at the next unlock (`kept: false`).
+
+**Spending** is counted against each allowance and sealed in `unlock/allowances.sealed` before the
+signature exists, under a key any unlocked wallet opens; what can't be written isn't signed, and a
+signature that fails gives its count back. With every wallet locked nothing signs under an allowance.
+A file that won't open is reported as `unreadable` and never overwritten.
+
+**Restarts.** An allowance and what it spent survive, in state `waiting`, until `resume_allowances`
+brings the password again. One granted with `endsAtRestart` is never written down. The manager has
+the keystore let go of every key when it starts, and of an account's key when no live allowance needs
+it.
+
+**The record.** Each signature is recorded before it is made, in `unlock/unattended.jsonl`, sealed
+with a key any unlocked wallet opens. `unattended_signatures` reads the newest 4096 records across
+restarts, each with `how`: `unattended`, `reviewed` or `password`. While every wallet is locked it
+lists this run's records and counts the rest as `unreadable`.
 
 ### Events
 
 `approval_offered` and `approval_settled` (handle, state), `approval_progress` when a request moves
 to `signing`, and `accounts_changed` (count) after a signer reports its accounts changed. For opening
-and unlocking: `access_requested`, `access_settled`, `unlock_changed` (account) and
+and allowances: `access_requested`, `access_settled`, `allowances_changed` (account) and
 `signed_without_asking` (handle). For wallets: `wallets_changed` (seed) when one is added,
 unlocked or changed, and `wallets_locked` (count). Handles and ids only: the event plane is
 unauthenticated.

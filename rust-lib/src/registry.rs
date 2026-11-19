@@ -281,6 +281,7 @@ mod tests {
                 shows_request: false,
                 collects: Collects::Nothing,
                 unlock_key: false,
+                holds_key: false,
             }
         }
         fn accounts(&mut self) -> logos_signer_interface::Result<Vec<Account>> {
